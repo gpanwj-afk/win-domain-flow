@@ -10,7 +10,7 @@
       font-family: "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
     }
     body {
-      width: 320px;
+      width: 340px;
       margin: 0;
       padding: 16px;
       background: #f8fafc;
@@ -47,12 +47,14 @@
       border-radius: 9px;
       background: #e2e8f0;
       font-size: 13px;
+      line-height: 1.45;
     }
     .ok { background: #d1fae5; color: #065f46; }
     .bad { background: #fee2e2; color: #991b1b; }
     .note {
       margin-top: 12px;
       font-size: 12px;
+      line-height: 1.5;
       color: #64748b;
     }
     @media (prefers-color-scheme: dark) {
@@ -68,13 +70,13 @@
 <body>
   <div class="card">
     <h1>浏览器活动诊断</h1>
-    <p>记录请求 URL、资源类型、MIME、来源页面与浏览器下载文件，不读取 HTTPS 正文。</p>
+    <p>记录每个网页请求的实际传输字节、URL、资源类型、MIME、来源页面，以及浏览器下载文件名和大小。</p>
     <label>
       <input id="enabled" type="checkbox">
-      启用诊断
+      启用深度诊断
     </label>
     <div id="status" class="status">正在检查本机接收器…</div>
-    <div class="note">需要同时运行“域流量管家”桌面程序。数据仅发送到 127.0.0.1。</div>
+    <div class="note">启用后浏览器会提示此扩展正在调试标签页，这是读取 Network 元数据所需的标准提示。扩展不会调用响应正文接口，数据仅发送到本机 127.0.0.1。</div>
   </div>
   <script src="popup.js"></script>
 </body>
