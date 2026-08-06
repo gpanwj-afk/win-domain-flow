@@ -1,0 +1,81 @@
+name: productize-fix1
+
+on:
+  push:
+    branches:
+      - agent/productize-cn-app-dashboard
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/productize-cn-app-dashboard
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt
+      - name: Apply compile fixes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          gui = Path('src/gui.rs')
+          text = gui.read_text()
+          text = text.replace('\n                    .show_percentage(false),', ',')
+          gui.write_text(text)
+
+          storage = Path('src/app_storage.rs')
+          text = storage.read_text()
+          old = '''        let rows = if let Some(application) = application {
+              let mut statement = self.conn.prepare(TOP_DOMAINS_FOR_APPLICATION_SQL)?;
+              statement
+                  .query_map(
+                      params![lower_bound, application, i64::from(limit)],
+                      map_domain_row,
+                  )?
+                  .collect::<Result<Vec<_>, _>>()?
+          } else {
+              let mut statement = self.conn.prepare(TOP_DOMAINS_ALL_SQL)?;
+              statement
+                  .query_map(params![lower_bound, i64::from(limit)], map_domain_row)?
+                  .collect::<Result<Vec<_>, _>>()?
+          };
+          Ok(rows)
+          '''
+          new = '''        let rows = if let Some(application) = application {
+              let mut statement = self.conn.prepare(TOP_DOMAINS_FOR_APPLICATION_SQL)?;
+              let mapped = statement.query_map(
+                  params![lower_bound, application, i64::from(limit)],
+                  map_domain_row,
+              )?;
+              mapped.collect::<Result<Vec<_>, _>>()?
+          } else {
+              let mut statement = self.conn.prepare(TOP_DOMAINS_ALL_SQL)?;
+              let mapped =
+                  statement.query_map(params![lower_bound, i64::from(limit)], map_domain_row)?;
+              mapped.collect::<Result<Vec<_>, _>>()?
+          };
+          Ok(rows)
+          '''
+          if old not in text:
+              raise SystemExit('top_domains block not found')
+          storage.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt
+          git diff --check
+      - name: Commit fixes
+        shell: bash
+        run: |
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src/gui.rs src/app_storage.rs
+            git commit -m "fix product dashboard compilation"
+            git push
+          fi
