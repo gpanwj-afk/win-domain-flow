@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - agent/v051-responsive-overflow-hotfix
+  pull_request:
+    branches:
+      - master
 
 permissions:
   contents: write
