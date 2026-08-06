@@ -4,6 +4,7 @@ use crate::model::{
 };
 use etherparse::{LaxPacketHeaders, LaxPayloadSlice, NetHeaders, TransportHeader};
 use pcap::Linktype;
+use std::net::IpAddr;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -50,7 +51,7 @@ pub fn parse_frame(
         _ => return Ok(None),
     };
 
-    let (source_port, dest_port, tcp_metadata) = match &headers.transport {
+    let (source_port, dest_port, protocol, tcp_metadata) = match &headers.transport {
         Some(TransportHeader::Tcp(tcp)) => {
             let payload = match &headers.payload {
                 LaxPayloadSlice::Tcp { payload, .. } => payload.to_vec(),
@@ -66,6 +67,7 @@ pub fn parse_frame(
             (
                 tcp.source_port,
                 tcp.destination_port,
+                TransportProtocol::Tcp,
                 Some(TcpMetadata {
                     sequence: tcp.sequence_number,
                     syn: tcp.syn,
@@ -76,7 +78,12 @@ pub fn parse_frame(
                 }),
             )
         }
-        Some(TransportHeader::Udp(udp)) => (udp.source_port, udp.destination_port, None),
+        Some(TransportHeader::Udp(udp)) => (
+            udp.source_port,
+            udp.destination_port,
+            TransportProtocol::Udp,
+            None,
+        ),
         _ => return Ok(None),
     };
 
@@ -96,7 +103,7 @@ pub fn parse_frame(
         ip: dest_ip,
         port: dest_port,
     };
-    let flow = FlowKey::canonical(TransportProtocol::Tcp, source.clone(), destination.clone());
+    let flow = FlowKey::canonical(protocol, source.clone(), destination.clone());
 
     Ok(Some(PacketObservation {
         timestamp_micros,
@@ -125,29 +132,40 @@ fn decode(linktype: Linktype, frame: &[u8]) -> Result<LaxPacketHeaders<'_>, Pack
     }
 }
 
-use std::net::IpAddr;
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_ipv4_tcp_client_hello_frame() {
+    fn build_tcp_frame(source_port: u16, destination_port: u16, payload: &[u8]) -> Vec<u8> {
         let builder =
             etherparse::PacketBuilder::ethernet2([0, 1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11])
                 .ipv4([10, 0, 0, 2], [93, 184, 216, 34], 64)
-                .tcp(50_000, 443, 1, 64_240);
-
-        let payload = vec![0x16, 0x03, 0x03, 0x00, 0x00];
+                .tcp(source_port, destination_port, 1, 64_240);
         let mut frame = Vec::with_capacity(builder.size(payload.len()));
-        builder.write(&mut frame, &payload).unwrap();
+        builder.write(&mut frame, payload).unwrap();
+        frame
+    }
+
+    fn build_udp_frame(source_port: u16, destination_port: u16, payload: &[u8]) -> Vec<u8> {
+        let builder =
+            etherparse::PacketBuilder::ethernet2([0, 1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11])
+                .ipv4([10, 0, 0, 2], [93, 184, 216, 34], 64)
+                .udp(source_port, destination_port);
+        let mut frame = Vec::with_capacity(builder.size(payload.len()));
+        builder.write(&mut frame, payload).unwrap();
+        frame
+    }
+
+    #[test]
+    fn parses_ipv4_tcp_client_hello_frame() {
+        let frame = build_tcp_frame(50_000, 443, &[0x16, 0x03, 0x03, 0x00, 0x00]);
 
         let result = parse_frame(Linktype::ETHERNET, &frame, frame.len() as u32, 1000).unwrap();
-        assert!(result.is_some());
+        let obs = result.expect("TCP/443 packet must be accepted");
 
-        let obs = result.unwrap();
-        assert_eq!(obs.source.port, 50000);
+        assert_eq!(obs.source.port, 50_000);
         assert_eq!(obs.destination.port, 443);
+        assert_eq!(obs.flow.protocol, TransportProtocol::Tcp);
         assert!(obs.tcp.is_some());
         assert_eq!(obs.tcp.unwrap().sequence, 1);
     }
@@ -168,45 +186,57 @@ mod tests {
         builder.write(&mut frame, &payload).unwrap();
 
         let result = parse_frame(Linktype::ETHERNET, &frame, frame.len() as u32, 2000).unwrap();
-        assert!(result.is_some());
+        let obs = result.expect("IPv6 TCP/443 packet must be accepted");
 
-        let obs = result.unwrap();
         assert_eq!(obs.source.port, 50_001);
         assert_eq!(obs.destination.port, 443);
+        assert_eq!(obs.flow.protocol, TransportProtocol::Tcp);
         assert!(obs.tcp.is_some());
     }
 
     #[test]
     fn parses_udp_443_as_unknown_candidate() {
-        let builder =
-            etherparse::PacketBuilder::ethernet2([0, 1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11])
-                .ipv4([10, 0, 0, 2], [93, 184, 216, 34], 64)
-                .udp(50_002, 443);
-
-        let payload = vec![0x00, 0x01, 0x02, 0x03];
-        let mut frame = Vec::with_capacity(builder.size(payload.len()));
-        builder.write(&mut frame, &payload).unwrap();
+        let frame = build_udp_frame(50_002, 443, &[0x00, 0x01, 0x02, 0x03]);
 
         let result = parse_frame(Linktype::ETHERNET, &frame, frame.len() as u32, 3000).unwrap();
-        assert!(result.is_some());
+        let obs = result.expect("UDP/443 packet must be accepted");
 
-        let obs = result.unwrap();
         assert_eq!(obs.source.port, 50_002);
         assert_eq!(obs.destination.port, 443);
+        assert_eq!(obs.flow.protocol, TransportProtocol::Udp);
         assert!(obs.tcp.is_none());
     }
 
     #[test]
+    fn tcp_and_udp_same_tuple_use_distinct_flow_keys() {
+        let tcp_frame = build_tcp_frame(50_002, 443, &[]);
+        let udp_frame = build_udp_frame(50_002, 443, &[]);
+
+        let tcp = parse_frame(
+            Linktype::ETHERNET,
+            &tcp_frame,
+            tcp_frame.len() as u32,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        let udp = parse_frame(
+            Linktype::ETHERNET,
+            &udp_frame,
+            udp_frame.len() as u32,
+            2,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_ne!(tcp.flow, udp.flow);
+        assert_eq!(tcp.flow.protocol, TransportProtocol::Tcp);
+        assert_eq!(udp.flow.protocol, TransportProtocol::Udp);
+    }
+
+    #[test]
     fn skips_non_443_transport() {
-        let builder =
-            etherparse::PacketBuilder::ethernet2([0, 1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11])
-                .ipv4([10, 0, 0, 2], [93, 184, 216, 34], 64)
-                .tcp(50_003, 80, 1, 64_240);
-
-        let payload = vec![0x47, 0x45, 0x54, 0x20];
-        let mut frame = Vec::with_capacity(builder.size(payload.len()));
-        builder.write(&mut frame, &payload).unwrap();
-
+        let frame = build_tcp_frame(50_003, 80, b"GET ");
         let result = parse_frame(Linktype::ETHERNET, &frame, frame.len() as u32, 4000).unwrap();
         assert!(result.is_none());
     }
