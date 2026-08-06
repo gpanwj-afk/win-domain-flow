@@ -1,6 +1,6 @@
 use crate::model::{
-    ApplicationDomainDelta, ApplicationFlushBatch, Counters, DomainDelta, FlushBatch,
-    HISTORICAL_APPLICATION, UNKNOWN_APPLICATION, UNKNOWN_DOMAIN,
+    ApplicationCounters, ApplicationDomainDelta, ApplicationFlushBatch, Counters, DomainDelta,
+    FlushBatch, HISTORICAL_APPLICATION, UNKNOWN_APPLICATION, UNKNOWN_DOMAIN,
 };
 use std::collections::HashMap;
 use std::mem;
@@ -62,7 +62,7 @@ impl DomainAccumulator {
 
 #[derive(Debug, Default)]
 pub struct ApplicationAccumulator {
-    buckets: HashMap<(i64, String, String), Counters>,
+    buckets: HashMap<(i64, String, String), ApplicationCounters>,
 }
 
 impl ApplicationAccumulator {
@@ -75,7 +75,7 @@ impl ApplicationAccumulator {
         let domain = normalize_domain(delta.domain);
         let key = (delta.day_start_utc, application, domain);
         let entry = self.buckets.entry(key).or_default();
-        entry.add_saturating(delta.counters.bytes, delta.counters.packets);
+        entry.add_saturating(delta.counters, delta.breakdown);
     }
 
     pub fn add_all<I>(&mut self, deltas: I)
@@ -96,7 +96,8 @@ impl ApplicationAccumulator {
                     day_start_utc,
                     application,
                     domain,
-                    counters,
+                    counters: counters.counters,
+                    breakdown: counters.breakdown,
                 },
             )
             .collect();
@@ -138,6 +139,7 @@ fn normalize_application(application: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{TrafficBreakdown, TransportProtocol};
 
     fn domain_delta(day: i64, domain: &str, bytes: u64, packets: u64) -> DomainDelta {
         DomainDelta {
@@ -153,12 +155,23 @@ mod tests {
         domain: &str,
         bytes: u64,
         packets: u64,
+        upload: bool,
+        protocol: TransportProtocol,
     ) -> ApplicationDomainDelta {
+        let mut breakdown = TrafficBreakdown::default();
+        for _ in 0..packets {
+            breakdown.add_saturating(TrafficBreakdown::from_packet(
+                bytes / packets.max(1),
+                upload,
+                protocol,
+            ));
+        }
         ApplicationDomainDelta {
             day_start_utc: day,
             application: application.to_string(),
             domain: domain.to_string(),
             counters: Counters { bytes, packets },
+            breakdown,
         }
     }
 
@@ -175,23 +188,58 @@ mod tests {
     }
 
     #[test]
-    fn application_rows_are_kept_separate() {
+    fn application_rows_are_kept_separate_and_details_are_added() {
         let mut acc = ApplicationAccumulator::new();
-        acc.add(app_delta(86_400, "chrome.exe", "example.com", 100, 1));
-        acc.add(app_delta(86_400, "msedge.exe", "example.com", 200, 2));
-        acc.add(app_delta(86_400, "chrome.exe", "example.com", 50, 1));
+        acc.add(app_delta(
+            86_400,
+            "chrome.exe",
+            "example.com",
+            100,
+            1,
+            true,
+            TransportProtocol::Tcp,
+        ));
+        acc.add(app_delta(
+            86_400,
+            "msedge.exe",
+            "example.com",
+            200,
+            2,
+            false,
+            TransportProtocol::Udp,
+        ));
+        acc.add(app_delta(
+            86_400,
+            "chrome.exe",
+            "example.com",
+            50,
+            1,
+            false,
+            TransportProtocol::Tcp,
+        ));
 
         let batch = acc.drain();
         assert_eq!(batch.rows.len(), 2);
         assert_eq!(batch.rows[0].application, "chrome.exe");
         assert_eq!(batch.rows[0].counters.bytes, 150);
+        assert_eq!(batch.rows[0].breakdown.upload_bytes, 100);
+        assert_eq!(batch.rows[0].breakdown.download_bytes, 50);
         assert_eq!(batch.rows[1].application, "msedge.exe");
+        assert_eq!(batch.rows[1].breakdown.udp_bytes, 200);
     }
 
     #[test]
     fn empty_names_are_normalized() {
         let mut acc = ApplicationAccumulator::new();
-        acc.add(app_delta(86_400, " ", "", 10, 1));
+        acc.add(app_delta(
+            86_400,
+            " ",
+            "",
+            10,
+            1,
+            true,
+            TransportProtocol::Tcp,
+        ));
         let batch = acc.drain();
         assert_eq!(batch.rows[0].application, UNKNOWN_APPLICATION);
         assert_eq!(batch.rows[0].domain, UNKNOWN_DOMAIN);
