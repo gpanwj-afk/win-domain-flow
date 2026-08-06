@@ -24,50 +24,40 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           gui = Path('src/gui.rs')
           text = gui.read_text()
-          text = text.replace('\n                    .show_percentage(false),', ',')
-          gui.write_text(text)
+          updated, count = re.subn(r'\n\s*\.show_percentage\(false\)', '', text, count=1)
+          if count != 1:
+              raise SystemExit(f'expected one show_percentage(false), found {count}')
+          gui.write_text(updated)
 
           storage = Path('src/app_storage.rs')
           text = storage.read_text()
-          old = '''        let rows = if let Some(application) = application {
-              let mut statement = self.conn.prepare(TOP_DOMAINS_FOR_APPLICATION_SQL)?;
-              statement
-                  .query_map(
-                      params![lower_bound, application, i64::from(limit)],
-                      map_domain_row,
-                  )?
-                  .collect::<Result<Vec<_>, _>>()?
-          } else {
-              let mut statement = self.conn.prepare(TOP_DOMAINS_ALL_SQL)?;
-              statement
-                  .query_map(params![lower_bound, i64::from(limit)], map_domain_row)?
-                  .collect::<Result<Vec<_>, _>>()?
-          };
-          Ok(rows)
-          '''
-          new = '''        let rows = if let Some(application) = application {
+          start = text.index('        let rows = if let Some(application) = application {')
+          end = text.index('        Ok(rows)\n', start) + len('        Ok(rows)\n')
+          replacement = '''        let rows = if let Some(application) = application {
               let mut statement = self.conn.prepare(TOP_DOMAINS_FOR_APPLICATION_SQL)?;
               let mapped = statement.query_map(
                   params![lower_bound, application, i64::from(limit)],
                   map_domain_row,
               )?;
-              mapped.collect::<Result<Vec<_>, _>>()?
+              let collected = mapped.collect::<Result<Vec<_>, _>>()?;
+              collected
           } else {
               let mut statement = self.conn.prepare(TOP_DOMAINS_ALL_SQL)?;
               let mapped =
                   statement.query_map(params![lower_bound, i64::from(limit)], map_domain_row)?;
-              mapped.collect::<Result<Vec<_>, _>>()?
+              let collected = mapped.collect::<Result<Vec<_>, _>>()?;
+              collected
           };
           Ok(rows)
           '''
-          if old not in text:
-              raise SystemExit('top_domains block not found')
-          storage.write_text(text.replace(old, new, 1))
+          storage.write_text(text[:start] + replacement + text[end:])
           PY
           cargo fmt
+          ! grep -R "show_percentage(false)" src/gui.rs
           git diff --check
       - name: Commit fixes
         shell: bash
