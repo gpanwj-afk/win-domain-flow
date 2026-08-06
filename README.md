@@ -24,9 +24,13 @@ This tool provides:
 ## Prerequisites
 
 - **Windows 10/11** (x64)
-- **Npcap** installed
+- **Npcap** installed (WinPcap API-compatible Mode)
 - **Rust 1.88.0** MSVC toolchain
 - **Visual Studio Build Tools 2022** with the C++ workload
+
+> **⚠️ Important:** Do NOT use Win10Pcap as a replacement. It has driver compatibility issues on many Windows versions. Always install the official Npcap from https://npcap.com with "WinPcap API-compatible Mode" enabled.
+
+For detailed installation instructions and troubleshooting, see [INSTALL.md](INSTALL.md) ([中文版](INSTALL_CN.md)).
 
 ## Building
 
