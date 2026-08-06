@@ -41,7 +41,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Apply validated transformations with error response fix
+      - name: Apply validated transformations and stabilize receiver test
         shell: bash
         run: |
           python3 - <<'PY'
@@ -91,6 +91,34 @@ jobs:
               text, count = pattern.subn(r'\1None,\n                                    \2', text, count=1)
               if count != 1:
                   raise SystemExit(f"error response call not found: {message}")
+
+          client_pattern = re.compile(
+              r'let client = thread::spawn\(move \|\| \{\s*'
+              r'let mut stream = TcpStream::connect\(address\)\.unwrap\(\);\s*'
+              r'stream\.write_all\(request\.as_bytes\(\)\)\.unwrap\(\);\s*'
+              r'\}\);\s*'
+              r'let \(mut stream, _\) = listener\.accept\(\)\.unwrap\(\);\s*'
+              r'let parsed = read_http_request\(&mut stream\)\.unwrap\(\);\s*'
+              r'client\.join\(\)\.unwrap\(\);',
+              re.S,
+          )
+          client_replacement = '''let (release_tx, release_rx) = std::sync::mpsc::channel();
+              let client = thread::spawn(move || {
+                  let mut stream = TcpStream::connect(address).unwrap();
+                  stream.write_all(request.as_bytes()).unwrap();
+                  stream.flush().unwrap();
+                  release_rx
+                      .recv_timeout(std::time::Duration::from_secs(2))
+                      .unwrap();
+              });
+              let (mut stream, _) = listener.accept().unwrap();
+              let parsed = read_http_request(&mut stream).unwrap();
+              release_tx.send(()).unwrap();
+              client.join().unwrap();'''
+          text, count = client_pattern.subn(client_replacement, text, count=1)
+          if count != 1:
+              raise SystemExit("HTTP parser test client block not found")
+
           path.write_text(text)
           PY
 
