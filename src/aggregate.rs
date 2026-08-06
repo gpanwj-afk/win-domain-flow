@@ -1,4 +1,7 @@
-use crate::model::{Counters, DomainDelta, FlushBatch, UNKNOWN_DOMAIN};
+use crate::model::{
+    ApplicationDomainDelta, ApplicationFlushBatch, Counters, DomainDelta, FlushBatch,
+    HISTORICAL_APPLICATION, UNKNOWN_APPLICATION, UNKNOWN_DOMAIN,
+};
 use std::collections::HashMap;
 use std::mem;
 
@@ -13,12 +16,7 @@ impl DomainAccumulator {
     }
 
     pub fn add(&mut self, delta: DomainDelta) {
-        let domain = if delta.domain.is_empty() {
-            UNKNOWN_DOMAIN.to_string()
-        } else {
-            delta.domain
-        };
-
+        let domain = normalize_domain(delta.domain);
         let key = (delta.day_start_utc, domain);
         let entry = self.buckets.entry(key).or_default();
         entry.add_saturating(delta.counters.bytes, delta.counters.packets);
@@ -62,130 +60,154 @@ impl DomainAccumulator {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct ApplicationAccumulator {
+    buckets: HashMap<(i64, String, String), Counters>,
+}
+
+impl ApplicationAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, delta: ApplicationDomainDelta) {
+        let application = normalize_application(delta.application);
+        let domain = normalize_domain(delta.domain);
+        let key = (delta.day_start_utc, application, domain);
+        let entry = self.buckets.entry(key).or_default();
+        entry.add_saturating(delta.counters.bytes, delta.counters.packets);
+    }
+
+    pub fn add_all<I>(&mut self, deltas: I)
+    where
+        I: IntoIterator<Item = ApplicationDomainDelta>,
+    {
+        for delta in deltas {
+            self.add(delta);
+        }
+    }
+
+    pub fn drain(&mut self) -> ApplicationFlushBatch {
+        let map = mem::take(&mut self.buckets);
+        let mut rows: Vec<ApplicationDomainDelta> = map
+            .into_iter()
+            .map(
+                |((day_start_utc, application, domain), counters)| ApplicationDomainDelta {
+                    day_start_utc,
+                    application,
+                    domain,
+                    counters,
+                },
+            )
+            .collect();
+
+        rows.sort_by(|a, b| {
+            a.day_start_utc
+                .cmp(&b.day_start_utc)
+                .then(a.application.cmp(&b.application))
+                .then(a.domain.cmp(&b.domain))
+        });
+
+        ApplicationFlushBatch { rows }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
+    }
+}
+
+fn normalize_domain(domain: String) -> String {
+    if domain.trim().is_empty() {
+        UNKNOWN_DOMAIN.to_string()
+    } else {
+        domain
+    }
+}
+
+fn normalize_application(application: String) -> String {
+    let trimmed = application.trim();
+    if trimmed.is_empty() {
+        UNKNOWN_APPLICATION.to_string()
+    } else if trimmed == HISTORICAL_APPLICATION {
+        HISTORICAL_APPLICATION.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn domain_delta(day: i64, domain: &str, bytes: u64, packets: u64) -> DomainDelta {
+        DomainDelta {
+            day_start_utc: day,
+            domain: domain.to_string(),
+            counters: Counters { bytes, packets },
+        }
+    }
+
+    fn app_delta(
+        day: i64,
+        application: &str,
+        domain: &str,
+        bytes: u64,
+        packets: u64,
+    ) -> ApplicationDomainDelta {
+        ApplicationDomainDelta {
+            day_start_utc: day,
+            application: application.to_string(),
+            domain: domain.to_string(),
+            counters: Counters { bytes, packets },
+        }
+    }
+
     #[test]
-    fn adds_same_key_with_saturation() {
+    fn adds_same_domain_key_with_saturation() {
         let mut acc = DomainAccumulator::new();
-
-        acc.add(DomainDelta {
-            day_start_utc: 86400,
-            domain: "example.com".to_string(),
-            counters: Counters {
-                bytes: 100,
-                packets: 1,
-            },
-        });
-
-        acc.add(DomainDelta {
-            day_start_utc: 86400,
-            domain: "example.com".to_string(),
-            counters: Counters {
-                bytes: 50,
-                packets: 2,
-            },
-        });
+        acc.add(domain_delta(86_400, "example.com", 100, 1));
+        acc.add(domain_delta(86_400, "example.com", 50, 2));
 
         assert_eq!(acc.len(), 1);
         let batch = acc.drain();
-        assert_eq!(batch.rows.len(), 1);
         assert_eq!(batch.rows[0].counters.bytes, 150);
         assert_eq!(batch.rows[0].counters.packets, 3);
     }
 
     #[test]
-    fn empty_domain_becomes_unknown() {
-        let mut acc = DomainAccumulator::new();
+    fn application_rows_are_kept_separate() {
+        let mut acc = ApplicationAccumulator::new();
+        acc.add(app_delta(86_400, "chrome.exe", "example.com", 100, 1));
+        acc.add(app_delta(86_400, "msedge.exe", "example.com", 200, 2));
+        acc.add(app_delta(86_400, "chrome.exe", "example.com", 50, 1));
 
-        acc.add(DomainDelta {
-            day_start_utc: 86400,
-            domain: "".to_string(),
-            counters: Counters {
-                bytes: 100,
-                packets: 1,
-            },
-        });
-
-        assert_eq!(acc.len(), 1);
         let batch = acc.drain();
-        assert_eq!(batch.rows.len(), 1);
+        assert_eq!(batch.rows.len(), 2);
+        assert_eq!(batch.rows[0].application, "chrome.exe");
+        assert_eq!(batch.rows[0].counters.bytes, 150);
+        assert_eq!(batch.rows[1].application, "msedge.exe");
+    }
+
+    #[test]
+    fn empty_names_are_normalized() {
+        let mut acc = ApplicationAccumulator::new();
+        acc.add(app_delta(86_400, " ", "", 10, 1));
+        let batch = acc.drain();
+        assert_eq!(batch.rows[0].application, UNKNOWN_APPLICATION);
         assert_eq!(batch.rows[0].domain, UNKNOWN_DOMAIN);
     }
 
     #[test]
     fn drain_sorts_and_clears() {
         let mut acc = DomainAccumulator::new();
+        acc.add(domain_delta(172_800, "beta.com", 50, 1));
+        acc.add(domain_delta(86_400, "alpha.com", 100, 2));
+        acc.add(domain_delta(86_400, "gamma.com", 75, 1));
 
-        acc.add(DomainDelta {
-            day_start_utc: 172800,
-            domain: "beta.com".to_string(),
-            counters: Counters {
-                bytes: 50,
-                packets: 1,
-            },
-        });
-
-        acc.add(DomainDelta {
-            day_start_utc: 86400,
-            domain: "alpha.com".to_string(),
-            counters: Counters {
-                bytes: 100,
-                packets: 2,
-            },
-        });
-
-        acc.add(DomainDelta {
-            day_start_utc: 86400,
-            domain: "gamma.com".to_string(),
-            counters: Counters {
-                bytes: 75,
-                packets: 1,
-            },
-        });
-
-        assert_eq!(acc.len(), 3);
         let batch = acc.drain();
         assert!(acc.is_empty());
-
-        assert_eq!(batch.rows.len(), 3);
         assert_eq!(batch.rows[0].domain, "alpha.com");
-        assert_eq!(batch.rows[0].day_start_utc, 86400);
         assert_eq!(batch.rows[1].domain, "gamma.com");
-        assert_eq!(batch.rows[1].day_start_utc, 86400);
         assert_eq!(batch.rows[2].domain, "beta.com");
-        assert_eq!(batch.rows[2].day_start_utc, 172800);
-    }
-
-    #[test]
-    fn different_days_remain_separate() {
-        let mut acc = DomainAccumulator::new();
-
-        acc.add(DomainDelta {
-            day_start_utc: 86400,
-            domain: "example.com".to_string(),
-            counters: Counters {
-                bytes: 100,
-                packets: 1,
-            },
-        });
-
-        acc.add(DomainDelta {
-            day_start_utc: 172800,
-            domain: "example.com".to_string(),
-            counters: Counters {
-                bytes: 200,
-                packets: 2,
-            },
-        });
-
-        assert_eq!(acc.len(), 2);
-        let batch = acc.drain();
-        assert_eq!(batch.rows.len(), 2);
-        assert_eq!(batch.rows[0].day_start_utc, 86400);
-        assert_eq!(batch.rows[0].counters.bytes, 100);
-        assert_eq!(batch.rows[1].day_start_utc, 172800);
-        assert_eq!(batch.rows[1].counters.bytes, 200);
     }
 }
