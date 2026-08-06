@@ -112,9 +112,7 @@ impl BrowserDiagnosticsPane {
             let requests = storage.recent_requests(filter, since_ms, 120)?;
             let downloads = storage.recent_downloads(filter, since_ms, 80)?;
             let summary = storage.resource_summary(filter, since_ms, 20)?;
-            Ok::<_, crate::browser_activity::BrowserActivityError>((
-                requests, downloads, summary,
-            ))
+            Ok::<_, crate::browser_activity::BrowserActivityError>((requests, downloads, summary))
         })();
 
         match result {
@@ -129,12 +127,7 @@ impl BrowserDiagnosticsPane {
         self.last_refresh = Instant::now();
     }
 
-    pub fn render(
-        &mut self,
-        ui: &mut egui::Ui,
-        theme: ThemeMode,
-        period: TrafficPeriod,
-    ) {
+    pub fn render(&mut self, ui: &mut egui::Ui, theme: ThemeMode, period: TrafficPeriod) {
         self.refresh_if_due(period);
         let palette = BrowserPalette::for_theme(theme);
 
@@ -166,7 +159,12 @@ impl BrowserDiagnosticsPane {
             });
 
             ui.add_space(8.0);
-            render_server_status(ui, self.server_status(), self.server_error.as_deref(), palette);
+            render_server_status(
+                ui,
+                self.server_status(),
+                self.server_error.as_deref(),
+                palette,
+            );
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("域名筛选").color(palette.muted));
@@ -187,8 +185,7 @@ impl BrowserDiagnosticsPane {
             });
             ui.label(
                 egui::RichText::new(format!(
-                    "扩展只向本机 127.0.0.1:{} 发送元数据，不上传正文。",
-                    BROWSER_DIAGNOSTICS_PORT
+                    "扩展只向本机 127.0.0.1:{BROWSER_DIAGNOSTICS_PORT} 发送元数据，不上传正文。"
                 ))
                 .small()
                 .color(palette.muted),
@@ -422,12 +419,7 @@ fn section_card<R>(
         .inner
 }
 
-fn status_chip(
-    ui: &mut egui::Ui,
-    text: &str,
-    color: egui::Color32,
-    palette: BrowserPalette,
-) {
+fn status_chip(ui: &mut egui::Ui, text: &str, color: egui::Color32, palette: BrowserPalette) {
     egui::Frame::default()
         .fill(palette.inner)
         .stroke(egui::Stroke::new(1.0, color))
@@ -452,11 +444,7 @@ fn download_card(ui: &mut egui::Ui, row: &BrowserDownloadRow, palette: BrowserPa
                 .and_then(|value| value.to_str())
                 .unwrap_or("文件名尚未确定");
             ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    egui::RichText::new(filename)
-                        .strong()
-                        .color(palette.text),
-                );
+                ui.label(egui::RichText::new(filename).strong().color(palette.text));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(
@@ -693,23 +681,22 @@ fn extension_dir() -> PathBuf {
         .join("browser-extension")
 }
 
+#[cfg(windows)]
 fn open_extension_folder() -> Result<(), String> {
     let folder = extension_dir();
     if !folder.is_dir() {
         return Err(format!("未找到浏览器扩展目录：{}", folder.display()));
     }
-    #[cfg(windows)]
-    {
-        std::process::Command::new("explorer.exe")
-            .arg(&folder)
-            .spawn()
-            .map_err(|error| format!("无法打开扩展目录：{error}"))?;
-    }
-    #[cfg(not(windows))]
-    {
-        return Err(format!("扩展目录：{}", folder.display()));
-    }
+    std::process::Command::new("explorer.exe")
+        .arg(&folder)
+        .spawn()
+        .map_err(|error| format!("无法打开扩展目录：{error}"))?;
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_extension_folder() -> Result<(), String> {
+    Err(format!("扩展目录：{}", extension_dir().display()))
 }
 
 #[cfg(test)]
