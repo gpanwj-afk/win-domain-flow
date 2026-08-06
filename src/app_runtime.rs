@@ -5,8 +5,8 @@ use crate::attribution::{create_process_attributor, ProcessAttributor};
 use crate::capture::{CaptureError, CaptureRead, PacketSource};
 use crate::flow::{FlowTracker, FlowTrackerConfig};
 use crate::model::{
-    ApplicationFlushBatch, FlushBatch, UNKNOWN_APPLICATION, DEFAULT_BUFFER_SIZE, DEFAULT_SNAPLEN,
-    DEFAULT_TIMEOUT_MS,
+    ApplicationFlushBatch, FlushBatch, DEFAULT_BUFFER_SIZE, DEFAULT_SNAPLEN, DEFAULT_TIMEOUT_MS,
+    UNKNOWN_APPLICATION,
 };
 use crate::packet::parse_packet;
 use crate::runtime::RuntimeConfig;
@@ -160,7 +160,8 @@ fn run_capture_loop<S: PacketSource>(
                 match parse_packet(&packet) {
                     Ok(Some(observation)) => {
                         summary.accepted_packets = summary.accepted_packets.saturating_add(1);
-                        let application = lookup_application(attributor, &observation.flow, summary);
+                        let application =
+                            lookup_application(attributor, &observation.flow, summary);
                         let flow_update = flow_tracker.observe(observation.clone());
                         let application_deltas = application_tracker.observe(
                             &observation,
@@ -198,12 +199,7 @@ fn run_capture_loop<S: PacketSource>(
         }
 
         if last_flush.elapsed() >= config.flush_interval {
-            submit_accumulators(
-                domain_accumulator,
-                application_accumulator,
-                writer,
-                summary,
-            )?;
+            submit_accumulators(domain_accumulator, application_accumulator, writer, summary)?;
             if let Some(error) = writer.poll_error() {
                 return Err(ApplicationRuntimeError::WriterFailed(error));
             }
@@ -272,9 +268,9 @@ fn finalize_run(
 }
 
 fn system_now_micros() -> Result<i64, ApplicationRuntimeError> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| ApplicationRuntimeError::InvalidConfig("system clock before Unix epoch".to_string()))?;
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+        ApplicationRuntimeError::InvalidConfig("system clock before Unix epoch".to_string())
+    })?;
     i64::try_from(duration.as_micros())
         .map_err(|_| ApplicationRuntimeError::InvalidConfig("system time overflow".to_string()))
 }
@@ -438,12 +434,10 @@ mod tests {
 
     fn udp_packet() -> OwnedPacket {
         let payload = b"quic";
-        let builder = etherparse::PacketBuilder::ethernet2(
-            [0, 1, 2, 3, 4, 5],
-            [6, 7, 8, 9, 10, 11],
-        )
-        .ipv4([10, 0, 0, 1], [1, 1, 1, 1], 64)
-        .udp(50_000, 443);
+        let builder =
+            etherparse::PacketBuilder::ethernet2([0, 1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11])
+                .ipv4([10, 0, 0, 1], [1, 1, 1, 1], 64)
+                .udp(50_000, 443);
         let mut frame = Vec::with_capacity(builder.size(payload.len()));
         builder.write(&mut frame, payload).unwrap();
         OwnedPacket {

@@ -98,7 +98,8 @@ mod windows_backend {
             self.identities.clear();
 
             for pid in pids {
-                self.identities.insert(pid, process_identity(&self.system, pid));
+                self.identities
+                    .insert(pid, process_identity(&self.system, pid));
             }
 
             for socket in sockets {

@@ -1,5 +1,4 @@
 use crate::app_storage::TrafficPeriod;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 const PRODUCT_DIR: &str = "win-domain-flow";
@@ -166,11 +165,6 @@ fn decode_hex(value: &str) -> Option<String> {
         })
         .collect::<Option<Vec<_>>>()?;
     String::from_utf8(bytes).ok()
-}
-
-#[allow(dead_code)]
-fn _os_string_round_trip(value: OsString) -> OsString {
-    value
 }
 
 #[cfg(test)]

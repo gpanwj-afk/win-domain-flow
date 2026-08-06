@@ -126,8 +126,7 @@ impl ApplicationTracker {
             .iter()
             .filter(|(_, state)| {
                 now_micros >= state.last_seen_micros
-                    && state.last_seen_micros
-                        <= now_micros.saturating_sub(self.idle_timeout_micros)
+                    && state.last_seen_micros <= now_micros.saturating_sub(self.idle_timeout_micros)
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -223,10 +222,7 @@ fn append_pending(
     }
 }
 
-fn append_unresolved(
-    mut state: ApplicationFlowState,
-    deltas: &mut Vec<ApplicationDomainDelta>,
-) {
+fn append_unresolved(mut state: ApplicationFlowState, deltas: &mut Vec<ApplicationDomainDelta>) {
     if state.domain.is_some() {
         return;
     }
@@ -267,11 +263,7 @@ mod tests {
         let destination = endpoint([93, 184, 216, 34], 443);
         PacketObservation {
             timestamp_micros,
-            flow: FlowKey::canonical(
-                TransportProtocol::Tcp,
-                source.clone(),
-                destination.clone(),
-            ),
+            flow: FlowKey::canonical(TransportProtocol::Tcp, source.clone(), destination.clone()),
             source,
             destination,
             wire_len: 64,
@@ -329,11 +321,7 @@ mod tests {
         let destination = endpoint([1, 1, 1, 1], 443);
         let observation = PacketObservation {
             timestamp_micros: 1_000_000,
-            flow: FlowKey::canonical(
-                TransportProtocol::Udp,
-                source.clone(),
-                destination.clone(),
-            ),
+            flow: FlowKey::canonical(TransportProtocol::Udp, source.clone(), destination.clone()),
             source,
             destination,
             wire_len: 54,

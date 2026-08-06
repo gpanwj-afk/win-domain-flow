@@ -1,10 +1,11 @@
+use crate::app_runtime::{run_live_with_shutdown, ApplicationRunSummary};
 use crate::app_storage::{ApplicationStorage, TrafficPeriod};
 use crate::capture::{list_devices, CaptureDeviceInfo};
 use crate::model::{
     TopApplicationRow, TopDomainRow, TrafficTotals, HISTORICAL_APPLICATION, UNKNOWN_APPLICATION,
     UNKNOWN_DOMAIN,
 };
-use crate::runtime::{run_live_with_shutdown, RunSummary, RuntimeConfig};
+use crate::runtime::RuntimeConfig;
 use crate::settings::{database_parent, product_data_dir, AppSettings};
 use eframe::egui;
 use std::path::{Path, PathBuf};
@@ -56,7 +57,7 @@ enum CaptureState {
 
 struct CaptureWorker {
     shutdown: Arc<AtomicBool>,
-    result_rx: Receiver<Result<RunSummary, String>>,
+    result_rx: Receiver<Result<ApplicationRunSummary, String>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -65,7 +66,7 @@ impl CaptureWorker {
         self.shutdown.store(true, Ordering::SeqCst);
     }
 
-    fn try_result(&self) -> Option<Result<RunSummary, String>> {
+    fn try_result(&self) -> Option<Result<ApplicationRunSummary, String>> {
         match self.result_rx.try_recv() {
             Ok(result) => Some(result),
             Err(TryRecvError::Empty) => None,
@@ -77,7 +78,9 @@ impl CaptureWorker {
 
     fn join(&mut self) -> Result<(), String> {
         if let Some(handle) = self.handle.take() {
-            handle.join().map_err(|_| "抓包线程发生异常。".to_string())?;
+            handle
+                .join()
+                .map_err(|_| "抓包线程发生异常。".to_string())?;
         }
         Ok(())
     }
@@ -107,7 +110,7 @@ struct DashboardApp {
     totals: TrafficTotals,
     state: CaptureState,
     capture: Option<CaptureWorker>,
-    last_summary: Option<RunSummary>,
+    last_summary: Option<ApplicationRunSummary>,
     last_refresh: Instant,
     last_rate_sample: Instant,
     last_total_bytes: u64,
@@ -350,7 +353,10 @@ impl DashboardApp {
 
         #[cfg(windows)]
         {
-            if let Err(error) = std::process::Command::new("explorer.exe").arg(&folder).spawn() {
+            if let Err(error) = std::process::Command::new("explorer.exe")
+                .arg(&folder)
+                .spawn()
+            {
                 self.notice = Some(format!("无法打开数据目录：{error}"));
             }
         }
@@ -509,11 +515,15 @@ impl DashboardApp {
 
     fn render_dashboard(&mut self, ui: &mut egui::Ui) {
         let app_coverage = percentage(
-            self.totals.bytes.saturating_sub(self.totals.unknown_application_bytes),
+            self.totals
+                .bytes
+                .saturating_sub(self.totals.unknown_application_bytes),
             self.totals.bytes,
         );
         let domain_coverage = percentage(
-            self.totals.bytes.saturating_sub(self.totals.unknown_domain_bytes),
+            self.totals
+                .bytes
+                .saturating_sub(self.totals.unknown_domain_bytes),
             self.totals.bytes,
         );
 
@@ -603,8 +613,8 @@ impl DashboardApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for row in rows {
-                        let selected = self.selected_application.as_deref()
-                            == Some(row.application.as_str());
+                        let selected =
+                            self.selected_application.as_deref() == Some(row.application.as_str());
                         let color = if row.application == UNKNOWN_APPLICATION {
                             AMBER
                         } else if row.application == HISTORICAL_APPLICATION {
@@ -640,9 +650,11 @@ impl DashboardApp {
                 .unwrap_or_else(|| "全部应用".to_string());
             ui.heading(egui::RichText::new(format!("{app_title} · 访问域名")).color(TEXT));
             ui.label(
-                egui::RichText::new("HTTPS 域名来自 TLS ClientHello；QUIC、ECH 或漏抓握手会显示为未知域名。")
-                    .small()
-                    .color(MUTED),
+                egui::RichText::new(
+                    "HTTPS 域名来自 TLS ClientHello；QUIC、ECH 或漏抓握手会显示为未知域名。",
+                )
+                .small()
+                .color(MUTED),
             );
             ui.add_space(8.0);
 
@@ -725,10 +737,7 @@ impl eframe::App for DashboardApp {
                                 .strong()
                                 .color(TEXT),
                         );
-                        ui.label(
-                            egui::RichText::new("Windows 应用与域名流量仪表盘")
-                                .color(MUTED),
-                        );
+                        ui.label(egui::RichText::new("Windows 应用与域名流量仪表盘").color(MUTED));
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         status_badge(ui, &self.state);
@@ -860,13 +869,20 @@ fn application_row(
     let fill = if selected { CARD_HOVER } else { CARD };
     let response = egui::Frame::default()
         .fill(fill)
-        .stroke(egui::Stroke::new(if selected { 1.5 } else { 0.5 }, if selected { color } else { BORDER }))
+        .stroke(egui::Stroke::new(
+            if selected { 1.5 } else { 0.5 },
+            if selected { color } else { BORDER },
+        ))
         .corner_radius(8)
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new(shorten_text(name, 34)).strong().color(TEXT));
+                    ui.label(
+                        egui::RichText::new(shorten_text(name, 34))
+                            .strong()
+                            .color(TEXT),
+                    );
                     ui.label(
                         egui::RichText::new(format!("{} 个数据包", format_integer(packets)))
                             .small()
@@ -874,7 +890,11 @@ fn application_row(
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(format_bytes(bytes)).strong().color(color));
+                    ui.label(
+                        egui::RichText::new(format_bytes(bytes))
+                            .strong()
+                            .color(color),
+                    );
                 });
             });
             ui.add(
@@ -891,10 +911,14 @@ fn application_row(
 fn empty_state(ui: &mut egui::Ui) {
     ui.add_space(30.0);
     ui.vertical_centered(|ui| {
-        ui.label(egui::RichText::new("暂无流量数据").size(20.0).strong().color(TEXT));
         ui.label(
-            egui::RichText::new("开始抓包并访问网页后，应用与域名会自动出现在这里。")
-                .color(MUTED),
+            egui::RichText::new("暂无流量数据")
+                .size(20.0)
+                .strong()
+                .color(TEXT),
+        );
+        ui.label(
+            egui::RichText::new("开始抓包并访问网页后，应用与域名会自动出现在这里。").color(MUTED),
         );
     });
 }
@@ -912,7 +936,9 @@ fn status_badge(ui: &mut egui::Ui, state: &CaptureState) {
         .stroke(egui::Stroke::new(1.0, color))
         .corner_radius(16)
         .inner_margin(egui::Margin::symmetric(12, 5))
-        .show(ui, |ui| ui.label(egui::RichText::new(text).strong().color(color)))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).strong().color(color))
+        })
         .response;
     if let CaptureState::Failed(error) = state {
         response.on_hover_text(error);

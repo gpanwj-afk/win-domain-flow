@@ -1,5 +1,5 @@
 use crate::model::{
-    ApplicationFlushBatch, HISTORICAL_APPLICATION, TopApplicationRow, TopDomainRow, TrafficTotals,
+    ApplicationFlushBatch, TopApplicationRow, TopDomainRow, TrafficTotals, HISTORICAL_APPLICATION,
     UNKNOWN_APPLICATION, UNKNOWN_DOMAIN,
 };
 use crate::storage::{Storage, StorageError};
@@ -175,11 +175,11 @@ impl ApplicationStorage {
     pub fn open(path: &Path) -> Result<Self, ApplicationStorageError> {
         drop(Storage::open(path)?);
 
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(APP_SCHEMA_SQL)?;
         validate_pragmas(&conn)?;
-        migrate_historical_rows(&mut conn.try_clone()?)?;
+        migrate_historical_rows(&mut conn)?;
         Ok(Self { conn })
     }
 
@@ -266,10 +266,7 @@ impl ApplicationStorage {
         Ok(rows)
     }
 
-    pub fn totals(
-        &self,
-        period: TrafficPeriod,
-    ) -> Result<TrafficTotals, ApplicationStorageError> {
+    pub fn totals(&self, period: TrafficPeriod) -> Result<TrafficTotals, ApplicationStorageError> {
         let lower_bound = self.period_start_utc(period)?;
         self.conn
             .prepare(TOTALS_SQL)?
@@ -292,10 +289,7 @@ impl ApplicationStorage {
             .map_err(Into::into)
     }
 
-    pub fn period_start_utc(
-        &self,
-        period: TrafficPeriod,
-    ) -> Result<i64, ApplicationStorageError> {
+    pub fn period_start_utc(&self, period: TrafficPeriod) -> Result<i64, ApplicationStorageError> {
         let sql = match period {
             TrafficPeriod::Today => {
                 "SELECT (CAST(strftime('%s','now') AS INTEGER) / 86400) * 86400"
@@ -311,7 +305,9 @@ impl ApplicationStorage {
             }
             TrafficPeriod::All => return Ok(0),
         };
-        self.conn.query_row(sql, [], |row| row.get(0)).map_err(Into::into)
+        self.conn
+            .query_row(sql, [], |row| row.get(0))
+            .map_err(Into::into)
     }
 }
 
