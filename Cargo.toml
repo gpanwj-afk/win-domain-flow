@@ -1,11 +1,11 @@
 [package]
 name = "win-domain-flow"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
 description = "Lightweight Windows domain-level network byte monitor"
-repository = "https://example.invalid/win-domain-flow"
+repository = "https://github.com/gpanwj-afk/win-domain-flow"
 publish = false
 
 [lib]
