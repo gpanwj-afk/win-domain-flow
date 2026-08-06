@@ -1,156 +1,158 @@
-# win-domain-flow
+# win-domain-flow 0.3
 
-Lightweight Windows domain-level network byte monitor. It captures TLS/HTTPS traffic through Npcap, extracts SNI from TLS ClientHello, and aggregates daily domain byte and packet counts in SQLite.
+Windows 本机应用与域名流量监控工具。通过 Npcap 捕获 HTTPS 流量，识别 TLS ClientHello 中的域名，并将流量按“应用 → 域名 → 日期”持久化到 SQLite。
 
-## Project Scope
+## 主要能力
 
-This tool provides:
+- 中文原生桌面界面，无需日常输入命令
+- 按应用查看流量，再下钻到该应用访问的域名
+- 今日、本月、近 7 天、近 30 天、全部历史等统计周期
+- 默认显示“本月累计”
+- 关闭窗口或重启电脑后继续保留并累加数据
+- 自动识别常用物理网卡
+- 安全停止抓包，退出前写入最后一批数据
+- 保留原有命令行工具，兼容自动化脚本
 
-- Network packet capture through Npcap/libpcap
-- TLS ClientHello SNI extraction for plaintext ClientHello records
-- Per-domain daily byte and packet counting
-- SQLite persistence with WAL mode
-- A native desktop dashboard for capture control and traffic visualization
-- A CLI for automation, device listing, capture, and top-domain queries
+## 数据会不会在关闭后清空？
 
-### What This Tool Does NOT Do
+不会。流量持续写入 SQLite，不依赖内存中的界面状态。
 
-- DNS-based domain resolution
-- QUIC SNI extraction
-- Process attribution, currently reserved for a later version
-- TLS certificate inspection
-- Traffic filtering by process
+默认数据库位置：
 
-## Prerequisites
+```text
+%LOCALAPPDATA%\win-domain-flow\domainflow.db
+```
 
-- **Windows 10/11**, x64
-- **Npcap** installed with WinPcap API-compatible Mode
-- **Rust 1.88.0** MSVC toolchain
-- **Visual Studio Build Tools 2022** with the C++ workload
+例如：
 
-> Do not use Win10Pcap as a replacement. Install official Npcap and enable WinPcap API-compatible Mode.
+```text
+C:\Users\你的用户名\AppData\Local\win-domain-flow\domainflow.db
+```
 
-For detailed installation instructions and troubleshooting, see [INSTALL.md](INSTALL.md) or [INSTALL_CN.md](INSTALL_CN.md).
+重新打开程序时会自动加载同一数据库，因此“本月累计”会从月初延续到当前时间。只有主动删除数据库文件或在界面中改用其他数据库，累计数据才会发生变化。
 
-## Building
+### 旧版数据迁移
+
+如果程序启动目录中已经存在旧版 `domainflow.db`，首次升级会继续使用该数据库，不会抛弃旧记录。升级前的数据没有应用字段，会显示在：
+
+```text
+历史数据（升级前未记录应用）
+```
+
+升级后新采集的数据会记录真实应用或“未知应用”。
+
+## 安装要求
+
+- Windows 10/11 x64
+- 官方 Npcap，建议安装时启用 `WinPcap API-compatible Mode`
+- 构建源码时需要 Rust 1.88.0 MSVC
+- 构建源码时需要 Visual Studio Build Tools 2022 C++ 工作负载
+- 构建源码时需要 Npcap SDK 1.16
+
+不要使用 Win10Pcap 替代 Npcap。
+
+## 构建
+
+在管理员 PowerShell 中：
 
 ```powershell
-# Set Npcap SDK paths when they are not configured system-wide.
 $env:LIB="C:\Npcap-SDK\Lib\x64;$env:LIB"
 $env:INCLUDE="C:\Npcap-SDK\Include;$env:INCLUDE"
 
 cargo build --release --locked
 ```
 
-The release build produces two programs:
+生成：
 
-- `target\release\win-domain-flow-gui.exe`: native desktop dashboard
-- `target\release\win-domain-flow.exe`: command-line interface
+```text
+target\release\win-domain-flow-gui.exe
+target\release\win-domain-flow.exe
+```
 
-## Desktop Dashboard
+## 使用中文 GUI
 
-Run PowerShell as Administrator, then launch:
+以管理员身份运行：
 
 ```powershell
 .\target\release\win-domain-flow-gui.exe
 ```
 
-The GUI can also be opened by double-clicking `win-domain-flow-gui.exe`. The Windows GUI executable does not open an additional console window.
+操作顺序：
 
-The dashboard provides:
+1. 选择当前联网的物理网卡。
+2. 点击“开始记录流量”。
+3. 正常使用浏览器、微信、腾讯会议等应用。
+4. 在左侧“应用流量排行”选择应用。
+5. 在右侧查看该应用访问的域名。
+6. 结束时点击“停止并安全保存”。
 
-- Npcap adapter discovery and selection
-- Start Capture and Stop and Flush controls
-- Configurable SQLite database path
-- Automatic or manual refresh
-- Visible traffic bytes and packet totals
-- Known-domain traffic share
-- Database growth rate while capture is running
-- Horizontal traffic bars for the leading domains
-- A ranked domain, byte, and packet table
-- Final capture summary after a graceful stop
+界面会记住：
 
-Stopping capture from the GUI uses the same shutdown-aware runtime path as Ctrl+C. Pending flow bytes are drained and the SQLite writer is shut down before the capture worker exits.
+- 上次选择的网卡
+- 数据库路径
+- 统计周期
+- 显示条数
+- 自动刷新设置
 
-Npcap live capture normally requires Administrator privileges. If capture fails immediately, restart the GUI from an elevated PowerShell or an elevated shortcut.
+设置文件位于：
 
-## Command-Line Usage
+```text
+%LOCALAPPDATA%\win-domain-flow\settings.conf
+```
 
-The original CLI remains available for scripts and advanced workflows.
+## 应用归因原理与边界
 
-### List Capture Devices
+Windows 版本通过系统 TCP/UDP 连接表读取 PID，再读取进程可执行文件名。归因属于尽力而为，以下情况可能显示“未知应用”：
+
+- 连接极短，在系统连接表刷新前已经关闭
+- 权限不足，无法读取部分系统服务或其他用户进程
+- 多个 UDP 进程使用相同本地端口，无法唯一判断
+- 抓包从连接中途开始，进程连接状态已经变化
+- VPN、代理或安全软件代替原应用建立外部连接
+
+“应用归因率”与“域名识别率”是两项独立指标：
+
+- 应用归因率：多少字节成功关联到 Windows 进程
+- 域名识别率：多少字节成功从 TLS ClientHello 识别域名
+
+## 域名识别边界
+
+- 支持明文 TLS ClientHello 中的 SNI
+- ECH 加密的 ClientHello 无法读取域名
+- UDP/443 和 QUIC 当前归入“未知域名”
+- 漏抓握手、乱序或缺失 TCP 分段时可能显示“未知域名”
+- 已建立连接在启动抓包后可能不会再次发送 ClientHello
+
+流量字节数使用 pcap 报告的线上长度，包含链路层、IP 和传输层头部；重传包会计入流量，因为它们确实占用了网络带宽。
+
+## 命令行工具
+
+### 枚举网卡
 
 ```powershell
 .\target\release\win-domain-flow.exe devices
 ```
 
-Output format:
-
-```text
-name\tdescription
-\Device\NPF_{...}\tNetwork adapter description
-```
-
-### Live Capture
+### 抓包
 
 ```powershell
-.\target\release\win-domain-flow.exe capture --interface "\Device\NPF_{...}"
+.\target\release\win-domain-flow.exe capture `
+  --interface "\Device\NPF_{...}" `
+  --db "$env:LOCALAPPDATA\win-domain-flow\domainflow.db"
 ```
 
-Options:
-
-- `--interface`: capture interface name, required
-- `--db`: database path, default `domainflow.db`
-- `--flush-seconds`: flush interval from 1 to 60 seconds, default 1
-- `--idle-seconds`: flow idle timeout from 1 to 86400 seconds, default 300
-- `--bpf`: BPF filter, default `tcp port 443 or udp port 443`
-
-### Query Top Domains
+### 查询域名排行
 
 ```powershell
-.\target\release\win-domain-flow.exe top
+.\target\release\win-domain-flow.exe top `
+  --db "$env:LOCALAPPDATA\win-domain-flow\domainflow.db" `
+  --days 30 `
+  --limit 50
 ```
 
-Options:
+命令行 `top` 继续读取兼容的域名汇总表。应用下钻功能目前以 GUI 为主。
 
-- `--db`: database path, default `domainflow.db`
-- `--days`: look back N UTC days, default 1
-- `--limit`: maximum rows, default 20
-
-Output format:
-
-```text
-domain\tbytes\tpackets
-example.com\t123456\t789
-```
-
-## Precision Boundaries
-
-### SNI Extraction Limitations
-
-- **Plaintext TLS ClientHello only**: ECH cannot be decoded.
-- **Connection reuse**: sessions that resume or multiplex remain attributed to the SNI observed at connection establishment.
-- **Truncated captures**: a ClientHello beyond the capture boundary may not yield SNI.
-- **Out-of-order or missing TCP segments**: a sequence gap ends best-effort ClientHello inspection for that connection; unresolved bytes are recorded as `(unknown)`.
-- **Pre-existing connections**: flows established before capture starts may not expose a ClientHello and may remain `(unknown)`.
-
-### UDP/443
-
-Every UDP/443 packet is attributed immediately to `(unknown)`. TCP and UDP flow keys include the transport protocol, so an identical endpoint tuple cannot inherit attribution across protocols.
-
-### Wire Bytes
-
-Reported bytes use the pcap packet-header wire length and include link, network, and transport headers. Retransmitted packets are counted because they consumed observed capacity, while retransmitted TLS payload is not appended twice to the ClientHello parser.
-
-### Dashboard Totals
-
-The dashboard labels its summary as **visible traffic** because the totals are calculated from the currently displayed top rows. Increase the Rows setting when a wider aggregate view is needed.
-
-### Database Merging
-
-Multiple capture sessions using the same database file merge counts through additive SQLite upserts. Different interfaces writing to the same database also merge because the MVP schema intentionally has no interface dimension.
-
-## Testing
+## 质量门禁
 
 ```powershell
 cargo fmt --check
@@ -160,19 +162,18 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo build --release --locked
 ```
 
-The integration fixture is `tests/fixtures/example_tls.pcap`. Its expected SHA-256 is documented in `tests/fixtures/README.md`.
+GitHub Actions 同时验证：
 
-## Manual Capture
+- Linux 完整测试、Clippy 和 Release 构建
+- Windows MSVC 编译
+- Npcap SDK 链接
+- Windows 进程归因代码
+- CLI 与 GUI 两个可执行文件
 
-For manual testing with Wireshark's `dumpcap`:
+## 隐私
 
-```powershell
-dumpcap.exe -D
-dumpcap.exe -i 1 -f "tcp port 443 or udp port 443" -a duration:20 -F pcap -s 0 -w tests\fixtures\manual_tls.pcap
-```
+所有数据保存在本机 SQLite 文件中。工具不上传抓包内容、域名列表或应用信息。
 
-Run the application in an elevated session when Npcap permissions require it. Generate ordinary HTTPS traffic during capture, stop through the GUI or Ctrl+C, then verify the database through the dashboard or the CLI `top` command.
+## 许可证
 
-## License
-
-MIT. See `Cargo.toml` for the package license declaration.
+MIT。
