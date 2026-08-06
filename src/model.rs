@@ -84,6 +84,79 @@ impl Counters {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrafficBreakdown {
+    pub upload_bytes: u64,
+    pub download_bytes: u64,
+    pub upload_packets: u64,
+    pub download_packets: u64,
+    pub tcp_bytes: u64,
+    pub udp_bytes: u64,
+    pub tcp_packets: u64,
+    pub udp_packets: u64,
+}
+
+impl TrafficBreakdown {
+    pub fn from_packet(wire_len: u64, upload: bool, protocol: TransportProtocol) -> Self {
+        let mut value = Self::default();
+        if upload {
+            value.upload_bytes = wire_len;
+            value.upload_packets = 1;
+        } else {
+            value.download_bytes = wire_len;
+            value.download_packets = 1;
+        }
+        match protocol {
+            TransportProtocol::Tcp => {
+                value.tcp_bytes = wire_len;
+                value.tcp_packets = 1;
+            }
+            TransportProtocol::Udp => {
+                value.udp_bytes = wire_len;
+                value.udp_packets = 1;
+            }
+        }
+        value
+    }
+
+    pub fn add_saturating(&mut self, other: Self) {
+        self.upload_bytes = self.upload_bytes.saturating_add(other.upload_bytes);
+        self.download_bytes = self.download_bytes.saturating_add(other.download_bytes);
+        self.upload_packets = self.upload_packets.saturating_add(other.upload_packets);
+        self.download_packets = self.download_packets.saturating_add(other.download_packets);
+        self.tcp_bytes = self.tcp_bytes.saturating_add(other.tcp_bytes);
+        self.udp_bytes = self.udp_bytes.saturating_add(other.udp_bytes);
+        self.tcp_packets = self.tcp_packets.saturating_add(other.tcp_packets);
+        self.udp_packets = self.udp_packets.saturating_add(other.udp_packets);
+    }
+
+    pub fn bytes(self) -> u64 {
+        self.upload_bytes.saturating_add(self.download_bytes)
+    }
+
+    pub fn packets(self) -> u64 {
+        self.upload_packets.saturating_add(self.download_packets)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.bytes() == 0 && self.packets() == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApplicationCounters {
+    pub counters: Counters,
+    pub breakdown: TrafficBreakdown,
+}
+
+impl ApplicationCounters {
+    pub fn add_saturating(&mut self, counters: Counters, breakdown: TrafficBreakdown) {
+        self.counters
+            .add_saturating(counters.bytes, counters.packets);
+        self.breakdown.add_saturating(breakdown);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainDelta {
     pub day_start_utc: i64,
@@ -97,6 +170,7 @@ pub struct ApplicationDomainDelta {
     pub application: String,
     pub domain: String,
     pub counters: Counters,
+    pub breakdown: TrafficBreakdown,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -129,6 +203,14 @@ pub struct TopDomainRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopDomainDetailRow {
+    pub domain: String,
+    pub bytes: u64,
+    pub packets: u64,
+    pub breakdown: TrafficBreakdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopApplicationRow {
     pub application: String,
     pub bytes: u64,
@@ -141,6 +223,7 @@ pub struct TrafficTotals {
     pub packets: u64,
     pub unknown_domain_bytes: u64,
     pub unknown_application_bytes: u64,
+    pub breakdown: TrafficBreakdown,
 }
 
 pub fn day_start_utc_from_micros(timestamp_micros: i64) -> i64 {
@@ -183,5 +266,21 @@ mod tests {
         counters.add_saturating(10, 10);
         assert_eq!(counters.bytes, u64::MAX);
         assert_eq!(counters.packets, u64::MAX);
+    }
+
+    #[test]
+    fn traffic_breakdown_tracks_direction_and_transport() {
+        let mut breakdown = TrafficBreakdown::from_packet(100, true, TransportProtocol::Tcp);
+        breakdown.add_saturating(TrafficBreakdown::from_packet(
+            250,
+            false,
+            TransportProtocol::Udp,
+        ));
+        assert_eq!(breakdown.upload_bytes, 100);
+        assert_eq!(breakdown.download_bytes, 250);
+        assert_eq!(breakdown.tcp_bytes, 100);
+        assert_eq!(breakdown.udp_bytes, 250);
+        assert_eq!(breakdown.bytes(), 350);
+        assert_eq!(breakdown.packets(), 2);
     }
 }

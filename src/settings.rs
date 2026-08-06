@@ -5,6 +5,36 @@ const PRODUCT_DIR: &str = "win-domain-flow";
 const DATABASE_FILE: &str = "domainflow.db";
 const SETTINGS_FILE: &str = "settings.conf";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeMode {
+    Light,
+    Dark,
+}
+
+impl ThemeMode {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    pub fn from_key(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("dark") {
+            Self::Dark
+        } else {
+            Self::Light
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Light => Self::Dark,
+            Self::Dark => Self::Light,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppSettings {
     pub selected_device: Option<String>,
@@ -13,6 +43,7 @@ pub struct AppSettings {
     pub row_limit: u32,
     pub auto_refresh: bool,
     pub refresh_seconds: u64,
+    pub theme: ThemeMode,
 }
 
 impl Default for AppSettings {
@@ -24,6 +55,7 @@ impl Default for AppSettings {
             row_limit: 40,
             auto_refresh: true,
             refresh_seconds: 1,
+            theme: ThemeMode::Light,
         }
     }
 }
@@ -62,6 +94,7 @@ impl AppSettings {
                         settings.refresh_seconds = value.clamp(1, 30);
                     }
                 }
+                "theme" => settings.theme = ThemeMode::from_key(value),
                 _ => {}
             }
         }
@@ -75,13 +108,14 @@ impl AppSettings {
         }
 
         let content = format!(
-            "selected_device={}\ndatabase_path={}\nperiod={}\nrow_limit={}\nauto_refresh={}\nrefresh_seconds={}\n",
+            "selected_device={}\ndatabase_path={}\nperiod={}\nrow_limit={}\nauto_refresh={}\nrefresh_seconds={}\ntheme={}\n",
             encode_hex(self.selected_device.as_deref().unwrap_or_default()),
             encode_hex(&self.database_path.to_string_lossy()),
             self.period.key(),
             self.row_limit,
             self.auto_refresh,
             self.refresh_seconds,
+            self.theme.key(),
         );
         let temp = path.with_extension("tmp");
         std::fs::write(&temp, content)?;
@@ -184,7 +218,17 @@ mod tests {
     }
 
     #[test]
-    fn default_view_is_month_to_date() {
-        assert_eq!(AppSettings::default().period, TrafficPeriod::MonthToDate);
+    fn default_view_is_month_to_date_and_light() {
+        let settings = AppSettings::default();
+        assert_eq!(settings.period, TrafficPeriod::MonthToDate);
+        assert_eq!(settings.theme, ThemeMode::Light);
+    }
+
+    #[test]
+    fn theme_keys_round_trip() {
+        assert_eq!(ThemeMode::from_key("light"), ThemeMode::Light);
+        assert_eq!(ThemeMode::from_key("dark"), ThemeMode::Dark);
+        assert_eq!(ThemeMode::Light.toggled(), ThemeMode::Dark);
+        assert_eq!(ThemeMode::Dark.toggled(), ThemeMode::Light);
     }
 }
