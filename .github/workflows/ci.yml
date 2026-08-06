@@ -142,15 +142,40 @@ jobs:
           if (!(Test-Path "$root\win-domain-flow.exe")) { throw "CLI executable missing" }
           if (!(Test-Path "$root\win-domain-flow-gui.exe")) { throw "GUI executable missing" }
 
+      - name: Assemble Windows package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $source = "target\x86_64-pc-windows-msvc\release"
+          $package = "dist\win-domain-flow-windows-x64"
+          Remove-Item $package -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+
+          Copy-Item "$source\win-domain-flow.exe" $package
+          Copy-Item "$source\win-domain-flow-gui.exe" $package
+          Copy-Item README.md, INSTALL.md, INSTALL_CN.md $package
+
+          @'
+          @echo off
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~dp0win-domain-flow-gui.exe' -WorkingDirectory '%~dp0' -Verb RunAs"
+          '@ | Set-Content -Path "$package\Start-GUI-As-Administrator.cmd" -Encoding Ascii
+
+          $required = @(
+            "$package\win-domain-flow.exe",
+            "$package\win-domain-flow-gui.exe",
+            "$package\README.md",
+            "$package\INSTALL.md",
+            "$package\INSTALL_CN.md",
+            "$package\Start-GUI-As-Administrator.cmd"
+          )
+          foreach ($item in $required) {
+            if (!(Test-Path $item)) { throw "Package item missing: $item" }
+          }
+
       - name: Upload Windows x64 package
         uses: actions/upload-artifact@v4
         with:
           name: win-domain-flow-windows-x64
           if-no-files-found: error
           retention-days: 14
-          path: |
-            target/x86_64-pc-windows-msvc/release/win-domain-flow.exe
-            target/x86_64-pc-windows-msvc/release/win-domain-flow-gui.exe
-            README.md
-            INSTALL.md
-            INSTALL_CN.md
+          path: dist/win-domain-flow-windows-x64/*
