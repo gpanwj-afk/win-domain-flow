@@ -251,17 +251,18 @@ impl ApplicationStorage {
 
         let rows = if let Some(application) = application {
             let mut statement = self.conn.prepare(TOP_DOMAINS_FOR_APPLICATION_SQL)?;
-            statement
-                .query_map(
-                    params![lower_bound, application, i64::from(limit)],
-                    map_domain_row,
-                )?
-                .collect::<Result<Vec<_>, _>>()?
+            let mapped = statement.query_map(
+                params![lower_bound, application, i64::from(limit)],
+                map_domain_row,
+            )?;
+            let collected = mapped.collect::<Result<Vec<_>, _>>()?;
+            collected
         } else {
             let mut statement = self.conn.prepare(TOP_DOMAINS_ALL_SQL)?;
-            statement
-                .query_map(params![lower_bound, i64::from(limit)], map_domain_row)?
-                .collect::<Result<Vec<_>, _>>()?
+            let mapped =
+                statement.query_map(params![lower_bound, i64::from(limit)], map_domain_row)?;
+            let collected = mapped.collect::<Result<Vec<_>, _>>()?;
+            collected
         };
         Ok(rows)
     }

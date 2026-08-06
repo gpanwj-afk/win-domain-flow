@@ -900,8 +900,7 @@ fn application_row(
             ui.add(
                 egui::ProgressBar::new(ratio.clamp(0.0, 1.0))
                     .desired_width(ui.available_width())
-                    .fill(color)
-                    .show_percentage(false),
+                    .fill(color),
             );
         })
         .response;
