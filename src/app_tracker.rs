@@ -1,7 +1,7 @@
 use crate::model::{
-    day_start_utc_from_micros, ApplicationDomainDelta, Counters, Endpoint, FlowKey,
-    PacketObservation, TransportProtocol, MAX_TRACKED_FLOWS, TLS_PORT, UNKNOWN_APPLICATION,
-    UNKNOWN_DOMAIN,
+    day_start_utc_from_micros, ApplicationCounters, ApplicationDomainDelta, Counters, Endpoint,
+    FlowKey, PacketObservation, TrafficBreakdown, TransportProtocol, MAX_TRACKED_FLOWS, TLS_PORT,
+    UNKNOWN_APPLICATION, UNKNOWN_DOMAIN,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::mem;
@@ -11,7 +11,7 @@ struct ApplicationFlowState {
     client: Endpoint,
     application: String,
     domain: Option<String>,
-    pending_by_day: BTreeMap<i64, Counters>,
+    pending_by_day: BTreeMap<i64, ApplicationCounters>,
     last_seen_micros: i64,
     initial_syn_sequence: Option<u32>,
     client_fin: bool,
@@ -41,7 +41,13 @@ impl ApplicationTracker {
     ) -> Vec<ApplicationDomainDelta> {
         let application = normalize_application(application);
         if packet.flow.protocol == TransportProtocol::Udp {
-            return vec![packet_delta(packet, &application, UNKNOWN_DOMAIN)];
+            let upload = packet.destination.port == TLS_PORT;
+            return vec![packet_delta(
+                packet,
+                &application,
+                UNKNOWN_DOMAIN,
+                upload,
+            )];
         }
 
         let mut deltas = Vec::new();
@@ -82,14 +88,21 @@ impl ApplicationTracker {
             }
 
             let is_client_to_server = packet.source == state.client;
+            let packet_counters = application_counters(packet, is_client_to_server);
             if let Some(domain) = state.domain.clone() {
-                deltas.push(packet_delta(packet, &state.application, &domain));
+                deltas.push(ApplicationDomainDelta {
+                    day_start_utc: day_start_utc_from_micros(packet.timestamp_micros),
+                    application: state.application.clone(),
+                    domain,
+                    counters: packet_counters.counters,
+                    breakdown: packet_counters.breakdown,
+                });
             } else {
-                state
+                let entry = state
                     .pending_by_day
                     .entry(day_start_utc_from_micros(packet.timestamp_micros))
-                    .or_default()
-                    .add_saturating(packet.wire_len, 1);
+                    .or_default();
+                entry.add_saturating(packet_counters.counters, packet_counters.breakdown);
 
                 if let Some(domain) = resolved_domain {
                     state.domain = Some(domain.to_string());
@@ -207,6 +220,16 @@ fn normalize_application(application: &str) -> String {
     }
 }
 
+fn application_counters(packet: &PacketObservation, upload: bool) -> ApplicationCounters {
+    ApplicationCounters {
+        counters: Counters {
+            bytes: packet.wire_len,
+            packets: 1,
+        },
+        breakdown: TrafficBreakdown::from_packet(packet.wire_len, upload, packet.flow.protocol),
+    }
+}
+
 fn append_pending(
     state: &mut ApplicationFlowState,
     domain: &str,
@@ -217,7 +240,8 @@ fn append_pending(
             day_start_utc,
             application: state.application.clone(),
             domain: domain.to_string(),
-            counters,
+            counters: counters.counters,
+            breakdown: counters.breakdown,
         });
     }
 }
@@ -233,15 +257,15 @@ fn packet_delta(
     packet: &PacketObservation,
     application: &str,
     domain: &str,
+    upload: bool,
 ) -> ApplicationDomainDelta {
+    let counters = application_counters(packet, upload);
     ApplicationDomainDelta {
         day_start_utc: day_start_utc_from_micros(packet.timestamp_micros),
         application: application.to_string(),
         domain: domain.to_string(),
-        counters: Counters {
-            bytes: packet.wire_len,
-            packets: 1,
-        },
+        counters: counters.counters,
+        breakdown: counters.breakdown,
     }
 }
 
@@ -258,19 +282,30 @@ mod tests {
         }
     }
 
-    fn packet(timestamp_micros: i64, sequence: u32, syn: bool, rst: bool) -> PacketObservation {
-        let source = endpoint([10, 0, 0, 1], 50_000);
-        let destination = endpoint([93, 184, 216, 34], 443);
+    fn packet(
+        timestamp_micros: i64,
+        sequence: u32,
+        syn: bool,
+        rst: bool,
+        reverse: bool,
+    ) -> PacketObservation {
+        let client = endpoint([10, 0, 0, 1], 50_000);
+        let server = endpoint([93, 184, 216, 34], 443);
+        let (source, destination) = if reverse {
+            (server.clone(), client.clone())
+        } else {
+            (client.clone(), server.clone())
+        };
         PacketObservation {
             timestamp_micros,
-            flow: FlowKey::canonical(TransportProtocol::Tcp, source.clone(), destination.clone()),
+            flow: FlowKey::canonical(TransportProtocol::Tcp, client, server),
             source,
             destination,
             wire_len: 64,
             tcp: Some(TcpMetadata {
                 sequence,
                 syn,
-                ack: false,
+                ack: reverse,
                 fin: false,
                 rst,
                 payload: Vec::new(),
@@ -279,26 +314,29 @@ mod tests {
     }
 
     #[test]
-    fn pending_packets_move_to_resolved_domain() {
+    fn pending_packets_move_to_resolved_domain_with_direction() {
         let mut tracker = ApplicationTracker::new(10_000_000);
-        let first = packet(1_000_000, 1, true, false);
+        let first = packet(1_000_000, 1, true, false, false);
         assert!(tracker.observe(&first, None, "chrome.exe").is_empty());
 
-        let second = packet(1_000_001, 2, false, false);
+        let second = packet(1_000_001, 2, false, false, true);
         let deltas = tracker.observe(&second, Some("example.com"), "chrome.exe");
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].application, "chrome.exe");
         assert_eq!(deltas[0].domain, "example.com");
         assert_eq!(deltas[0].counters.bytes, 128);
         assert_eq!(deltas[0].counters.packets, 2);
+        assert_eq!(deltas[0].breakdown.upload_bytes, 64);
+        assert_eq!(deltas[0].breakdown.download_bytes, 64);
+        assert_eq!(deltas[0].breakdown.tcp_bytes, 128);
     }
 
     #[test]
     fn unresolved_rst_is_saved_under_application() {
         let mut tracker = ApplicationTracker::new(10_000_000);
-        let first = packet(1_000_000, 1, true, false);
+        let first = packet(1_000_000, 1, true, false, false);
         tracker.observe(&first, None, "msedge.exe");
-        let rst = packet(1_000_001, 2, false, true);
+        let rst = packet(1_000_001, 2, false, true, true);
         let deltas = tracker.observe(&rst, None, "msedge.exe");
         assert_eq!(deltas[0].application, "msedge.exe");
         assert_eq!(deltas[0].domain, UNKNOWN_DOMAIN);
@@ -308,15 +346,15 @@ mod tests {
     #[test]
     fn known_application_upgrades_unknown_state() {
         let mut tracker = ApplicationTracker::new(10_000_000);
-        let first = packet(1_000_000, 1, true, false);
+        let first = packet(1_000_000, 1, true, false, false);
         tracker.observe(&first, None, UNKNOWN_APPLICATION);
-        let second = packet(1_000_001, 2, false, false);
+        let second = packet(1_000_001, 2, false, false, false);
         let deltas = tracker.observe(&second, Some("example.com"), "firefox.exe");
         assert_eq!(deltas[0].application, "firefox.exe");
     }
 
     #[test]
-    fn udp_is_immediately_attributed_to_unknown_domain() {
+    fn udp_is_immediately_attributed_with_direction_and_protocol() {
         let source = endpoint([10, 0, 0, 1], 53_000);
         let destination = endpoint([1, 1, 1, 1], 443);
         let observation = PacketObservation {
@@ -331,5 +369,7 @@ mod tests {
         let deltas = tracker.observe(&observation, None, "chrome.exe");
         assert_eq!(deltas[0].domain, UNKNOWN_DOMAIN);
         assert_eq!(deltas[0].application, "chrome.exe");
+        assert_eq!(deltas[0].breakdown.upload_bytes, 54);
+        assert_eq!(deltas[0].breakdown.udp_bytes, 54);
     }
 }
