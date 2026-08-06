@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>域流量管家 · 浏览器活动诊断</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+    }
+    body {
+      width: 320px;
+      margin: 0;
+      padding: 16px;
+      background: #f8fafc;
+      color: #0f172a;
+    }
+    .card {
+      border: 1px solid #cbd5e1;
+      border-radius: 12px;
+      background: #fff;
+      padding: 14px;
+      box-shadow: 0 6px 20px rgba(15, 23, 42, 0.08);
+    }
+    h1 {
+      font-size: 17px;
+      margin: 0 0 6px;
+    }
+    p {
+      margin: 6px 0;
+      color: #475569;
+      line-height: 1.5;
+      font-size: 13px;
+    }
+    label {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 12px;
+      font-weight: 700;
+    }
+    input { width: 18px; height: 18px; }
+    .status {
+      margin-top: 12px;
+      padding: 8px 10px;
+      border-radius: 9px;
+      background: #e2e8f0;
+      font-size: 13px;
+    }
+    .ok { background: #d1fae5; color: #065f46; }
+    .bad { background: #fee2e2; color: #991b1b; }
+    .note {
+      margin-top: 12px;
+      font-size: 12px;
+      color: #64748b;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: #0f172a; color: #f8fafc; }
+      .card { background: #18253a; border-color: #475569; box-shadow: none; }
+      p, .note { color: #cbd5e1; }
+      .status { background: #334155; }
+      .ok { background: #064e3b; color: #a7f3d0; }
+      .bad { background: #7f1d1d; color: #fecaca; }
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>浏览器活动诊断</h1>
+    <p>记录请求 URL、资源类型、MIME、来源页面与浏览器下载文件，不读取 HTTPS 正文。</p>
+    <label>
+      <input id="enabled" type="checkbox">
+      启用诊断
+    </label>
+    <div id="status" class="status">正在检查本机接收器…</div>
+    <div class="note">需要同时运行“域流量管家”桌面程序。数据仅发送到 127.0.0.1。</div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
