@@ -146,12 +146,7 @@ fn run_source<S: PacketSource>(
         &writer,
     );
 
-    let finalization_result = finalize_run(
-        &mut tracker,
-        &mut accumulator,
-        writer,
-        &mut summary,
-    );
+    let finalization_result = finalize_run(&mut tracker, &mut accumulator, writer, &mut summary);
 
     complete_run(loop_result, finalization_result)?;
     Ok(summary)
@@ -397,7 +392,9 @@ mod tests {
     #[test]
     fn fake_source_processes_udp_and_persists_unknown() {
         let mut events = VecDeque::new();
-        events.push_back(Ok(CaptureRead::Packet(udp_443_packet(1_700_000_000_000_000))));
+        events.push_back(Ok(CaptureRead::Packet(udp_443_packet(
+            1_700_000_000_000_000,
+        ))));
         events.push_back(Ok(CaptureRead::EndOfFile));
 
         let mut source = FakePacketSource::new(events);
@@ -432,7 +429,9 @@ mod tests {
     #[test]
     fn final_flush_persists_unresolved_tcp_flow() {
         let mut events = VecDeque::new();
-        events.push_back(Ok(CaptureRead::Packet(tcp_syn_packet(1_700_000_000_000_000))));
+        events.push_back(Ok(CaptureRead::Packet(tcp_syn_packet(
+            1_700_000_000_000_000,
+        ))));
         events.push_back(Ok(CaptureRead::EndOfFile));
 
         let mut source = FakePacketSource::new(events);
@@ -472,7 +471,9 @@ mod tests {
 
         let mut events = VecDeque::new();
         events.push_back(Ok(CaptureRead::Packet(bad_packet)));
-        events.push_back(Ok(CaptureRead::Packet(udp_443_packet(1_700_000_001_000_000))));
+        events.push_back(Ok(CaptureRead::Packet(udp_443_packet(
+            1_700_000_001_000_000,
+        ))));
         events.push_back(Ok(CaptureRead::EndOfFile));
 
         let mut source = FakePacketSource::new(events);

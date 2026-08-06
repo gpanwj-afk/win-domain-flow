@@ -212,22 +212,12 @@ mod tests {
         let tcp_frame = build_tcp_frame(50_002, 443, &[]);
         let udp_frame = build_udp_frame(50_002, 443, &[]);
 
-        let tcp = parse_frame(
-            Linktype::ETHERNET,
-            &tcp_frame,
-            tcp_frame.len() as u32,
-            1,
-        )
-        .unwrap()
-        .unwrap();
-        let udp = parse_frame(
-            Linktype::ETHERNET,
-            &udp_frame,
-            udp_frame.len() as u32,
-            2,
-        )
-        .unwrap()
-        .unwrap();
+        let tcp = parse_frame(Linktype::ETHERNET, &tcp_frame, tcp_frame.len() as u32, 1)
+            .unwrap()
+            .unwrap();
+        let udp = parse_frame(Linktype::ETHERNET, &udp_frame, udp_frame.len() as u32, 2)
+            .unwrap()
+            .unwrap();
 
         assert_ne!(tcp.flow, udp.flow);
         assert_eq!(tcp.flow.protocol, TransportProtocol::Tcp);

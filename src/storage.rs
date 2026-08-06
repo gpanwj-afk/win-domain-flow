@@ -226,9 +226,7 @@ fn validate_pragmas(conn: &Connection) -> Result<(), StorageError> {
 
     let synchronous: i64 = conn.pragma_query_value(None, "synchronous", |row| row.get(0))?;
     if synchronous != SQLITE_SYNCHRONOUS_NORMAL {
-        return Err(StorageError::PragmaMismatch(
-            "synchronous is not NORMAL",
-        ));
+        return Err(StorageError::PragmaMismatch("synchronous is not NORMAL"));
     }
 
     Ok(())
@@ -519,7 +517,9 @@ mod tests {
     fn empty_batch_is_noop() {
         let path = temp_db_path("empty_batch");
         let mut storage = Storage::open(&path).unwrap();
-        storage.upsert_batch(&FlushBatch { rows: Vec::new() }).unwrap();
+        storage
+            .upsert_batch(&FlushBatch { rows: Vec::new() })
+            .unwrap();
         assert!(storage.top_domains_since(0, 10).unwrap().is_empty());
 
         drop(storage);
@@ -554,10 +554,7 @@ mod tests {
             rows: vec![delta(86_400, "example.com", u64::MAX, 1)],
         });
 
-        assert!(matches!(
-            result,
-            Err(StorageError::CounterTooLarge { .. })
-        ));
+        assert!(matches!(result, Err(StorageError::CounterTooLarge { .. })));
 
         drop(storage);
         cleanup_db(&path);

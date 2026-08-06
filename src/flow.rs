@@ -1,7 +1,7 @@
 use crate::model::{
     day_start_utc_from_micros, Counters, DomainDelta, Endpoint, FlowKey, PacketObservation,
-    TcpMetadata, TransportProtocol, DEFAULT_IDLE_TIMEOUT_SECS, MAX_TLS_BUFFER,
-    MAX_TRACKED_FLOWS, TLS_PORT, UNKNOWN_DOMAIN,
+    TcpMetadata, TransportProtocol, DEFAULT_IDLE_TIMEOUT_SECS, MAX_TLS_BUFFER, MAX_TRACKED_FLOWS,
+    TLS_PORT, UNKNOWN_DOMAIN,
 };
 use crate::tls::{parse_client_hello_sni, TlsParseResult};
 use std::collections::{BTreeMap, HashMap};
@@ -107,9 +107,10 @@ impl FlowTracker {
         let retransmitted_syn = is_syn
             && self.flows.get(&key).is_some_and(|state| {
                 state.initial_syn_sequence.is_some()
-                    && packet.tcp.as_ref().is_some_and(|tcp| {
-                        state.initial_syn_sequence == Some(tcp.sequence)
-                    })
+                    && packet
+                        .tcp
+                        .as_ref()
+                        .is_some_and(|tcp| state.initial_syn_sequence == Some(tcp.sequence))
             });
 
         if is_syn && !retransmitted_syn {
@@ -148,11 +149,8 @@ impl FlowTracker {
                 if is_client_to_server {
                     if let Some(tcp) = packet.tcp.as_ref() {
                         if !tcp.payload.is_empty() {
-                            if let Some(domain) = inspect_tls(
-                                flow,
-                                tcp,
-                                self.config.max_tls_buffer,
-                            ) {
+                            if let Some(domain) = inspect_tls(flow, tcp, self.config.max_tls_buffer)
+                            {
                                 resolve_domain(flow, domain, &mut update);
                             }
                         }
@@ -267,11 +265,7 @@ fn new_flow_state(packet: &PacketObservation, is_syn: bool) -> FlowState {
     }
 }
 
-fn inspect_tls(
-    flow: &mut FlowState,
-    tcp: &TcpMetadata,
-    max_tls_buffer: usize,
-) -> Option<String> {
+fn inspect_tls(flow: &mut FlowState, tcp: &TcpMetadata, max_tls_buffer: usize) -> Option<String> {
     let state = mem::replace(&mut flow.inspection, InspectionState::Finished);
 
     match state {
@@ -299,8 +293,8 @@ fn inspect_tls(
                 }
 
                 assembler.bytes.extend_from_slice(&tcp.payload);
-                assembler.expected_next_sequence = sequence
-                    .wrapping_add(u32::try_from(tcp.payload.len()).unwrap_or(u32::MAX));
+                assembler.expected_next_sequence =
+                    sequence.wrapping_add(u32::try_from(tcp.payload.len()).unwrap_or(u32::MAX));
                 evaluate_assembler(flow, assembler, max_tls_buffer)
             } else if seq_before(sequence, assembler.expected_next_sequence) {
                 flow.inspection = InspectionState::Collecting(assembler);
@@ -320,9 +314,7 @@ fn evaluate_assembler(
 ) -> Option<String> {
     match parse_client_hello_sni(&assembler.bytes) {
         TlsParseResult::Sni(domain) => Some(domain),
-        TlsParseResult::NeedMoreData { required_total }
-            if required_total <= max_tls_buffer =>
-        {
+        TlsParseResult::NeedMoreData { required_total } if required_total <= max_tls_buffer => {
             flow.inspection = InspectionState::Collecting(assembler);
             None
         }
@@ -423,7 +415,13 @@ mod tests {
         }
     }
 
-    fn syn(flow: &FlowKey, client: &Endpoint, server: &Endpoint, ts: i64, seq: u32) -> PacketObservation {
+    fn syn(
+        flow: &FlowKey,
+        client: &Endpoint,
+        server: &Endpoint,
+        ts: i64,
+        seq: u32,
+    ) -> PacketObservation {
         tcp_packet(
             flow,
             client,
@@ -441,11 +439,11 @@ mod tests {
 
     fn client_hello() -> Vec<u8> {
         vec![
-            0x16, 0x03, 0x01, 0x00, 0x43, 0x01, 0x00, 0x00, 0x3f, 0x03, 0x03, 0, 1, 2, 3, 4,
-            5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 0x00, 0x00, 0x02, 0x13, 0x01, 0x01, 0x00, 0x00,
-            0x14, 0x00, 0x00, 0x00, 0x10, 0x00, 0x0e, 0x00, 0x00, 0x0b, b'e', b'x', b'a',
-            b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm',
+            0x16, 0x03, 0x01, 0x00, 0x43, 0x01, 0x00, 0x00, 0x3f, 0x03, 0x03, 0, 1, 2, 3, 4, 5, 6,
+            7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+            29, 30, 31, 0x00, 0x00, 0x02, 0x13, 0x01, 0x01, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00,
+            0x10, 0x00, 0x0e, 0x00, 0x00, 0x0b, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.',
+            b'c', b'o', b'm',
         ]
     }
 
@@ -489,7 +487,13 @@ mod tests {
         let update = resolve_example(&mut tracker, &client, &server, &flow, 1_000_000, 1_000);
 
         assert_eq!(update.newly_resolved_domain.as_deref(), Some("example.com"));
-        assert_eq!(sum_counters(&update.deltas, "example.com"), Counters { bytes: 190, packets: 2 });
+        assert_eq!(
+            sum_counters(&update.deltas, "example.com"),
+            Counters {
+                bytes: 190,
+                packets: 2
+            }
+        );
         assert_eq!(tracker.active_flows(), 1);
     }
 
@@ -530,8 +534,17 @@ mod tests {
             second.to_vec(),
         ));
 
-        assert_eq!(second_update.newly_resolved_domain.as_deref(), Some("example.com"));
-        assert_eq!(sum_counters(&second_update.deltas, "example.com"), Counters { bytes: 244, packets: 3 });
+        assert_eq!(
+            second_update.newly_resolved_domain.as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            sum_counters(&second_update.deltas, "example.com"),
+            Counters {
+                bytes: 244,
+                packets: 3
+            }
+        );
     }
 
     #[test]
@@ -583,7 +596,13 @@ mod tests {
         ));
 
         assert_eq!(update.newly_resolved_domain.as_deref(), Some("example.com"));
-        assert_eq!(sum_counters(&update.deltas, "example.com"), Counters { bytes: 338, packets: 4 });
+        assert_eq!(
+            sum_counters(&update.deltas, "example.com"),
+            Counters {
+                bytes: 338,
+                packets: 4
+            }
+        );
     }
 
     #[test]
@@ -610,7 +629,13 @@ mod tests {
             client_hello(),
         ));
 
-        assert_eq!(sum_counters(&update.deltas, "example.com"), Counters { bytes: 254, packets: 3 });
+        assert_eq!(
+            sum_counters(&update.deltas, "example.com"),
+            Counters {
+                bytes: 254,
+                packets: 3
+            }
+        );
     }
 
     #[test]
@@ -647,7 +672,13 @@ mod tests {
         ));
 
         let deltas = tracker.drain_all();
-        assert_eq!(sum_counters(&deltas, UNKNOWN_DOMAIN), Counters { bytes: 238, packets: 3 });
+        assert_eq!(
+            sum_counters(&deltas, UNKNOWN_DOMAIN),
+            Counters {
+                bytes: 238,
+                packets: 3
+            }
+        );
     }
 
     #[test]
@@ -685,7 +716,13 @@ mod tests {
 
         assert_eq!(tracker.active_flows(), 0);
         assert_eq!(update.evicted_flows, 1);
-        assert_eq!(sum_counters(&update.deltas, UNKNOWN_DOMAIN), Counters { bytes: 212, packets: 3 });
+        assert_eq!(
+            sum_counters(&update.deltas, UNKNOWN_DOMAIN),
+            Counters {
+                bytes: 212,
+                packets: 3
+            }
+        );
     }
 
     #[test]
@@ -693,11 +730,7 @@ mod tests {
         let mut tracker = FlowTracker::new(FlowTrackerConfig::default());
         let source = endpoint([10, 0, 0, 1], 50_006);
         let destination = endpoint([93, 184, 216, 34], 443);
-        let flow = FlowKey::canonical(
-            TransportProtocol::Udp,
-            source.clone(),
-            destination.clone(),
-        );
+        let flow = FlowKey::canonical(TransportProtocol::Udp, source.clone(), destination.clone());
 
         let update = tracker.observe(PacketObservation {
             timestamp_micros: 7_000_000,
@@ -710,7 +743,13 @@ mod tests {
 
         assert_eq!(update.deltas.len(), 1);
         assert_eq!(update.deltas[0].domain, UNKNOWN_DOMAIN);
-        assert_eq!(update.deltas[0].counters, Counters { bytes: 54, packets: 1 });
+        assert_eq!(
+            update.deltas[0].counters,
+            Counters {
+                bytes: 54,
+                packets: 1
+            }
+        );
         assert_eq!(tracker.active_flows(), 0);
     }
 
@@ -719,13 +758,12 @@ mod tests {
         let mut tracker = FlowTracker::new(FlowTrackerConfig::default());
         let (client, server, tcp_flow) = endpoints(50_007);
         let resolved = resolve_example(&mut tracker, &client, &server, &tcp_flow, 8_000_000, 8_000);
-        assert_eq!(resolved.newly_resolved_domain.as_deref(), Some("example.com"));
-
-        let udp_flow = FlowKey::canonical(
-            TransportProtocol::Udp,
-            client.clone(),
-            server.clone(),
+        assert_eq!(
+            resolved.newly_resolved_domain.as_deref(),
+            Some("example.com")
         );
+
+        let udp_flow = FlowKey::canonical(TransportProtocol::Udp, client.clone(), server.clone());
         let update = tracker.observe(PacketObservation {
             timestamp_micros: 8_000_002,
             flow: udp_flow,
@@ -752,7 +790,13 @@ mod tests {
         let deltas = tracker.expire_idle(301_000_000);
 
         assert_eq!(tracker.active_flows(), 0);
-        assert_eq!(sum_counters(&deltas, UNKNOWN_DOMAIN), Counters { bytes: 64, packets: 1 });
+        assert_eq!(
+            sum_counters(&deltas, UNKNOWN_DOMAIN),
+            Counters {
+                bytes: 64,
+                packets: 1
+            }
+        );
     }
 
     #[test]
@@ -775,7 +819,13 @@ mod tests {
             Vec::new(),
         ));
 
-        assert_eq!(sum_counters(&update.deltas, "example.com"), Counters { bytes: 54, packets: 1 });
+        assert_eq!(
+            sum_counters(&update.deltas, "example.com"),
+            Counters {
+                bytes: 54,
+                packets: 1
+            }
+        );
         assert_eq!(update.evicted_flows, 1);
         assert_eq!(tracker.active_flows(), 0);
     }
@@ -799,7 +849,13 @@ mod tests {
             false,
             Vec::new(),
         ));
-        assert_eq!(sum_counters(&first_fin.deltas, "example.com"), Counters { bytes: 54, packets: 1 });
+        assert_eq!(
+            sum_counters(&first_fin.deltas, "example.com"),
+            Counters {
+                bytes: 54,
+                packets: 1
+            }
+        );
         assert_eq!(tracker.active_flows(), 1);
 
         let second_fin = tracker.observe(tcp_packet(
@@ -815,7 +871,13 @@ mod tests {
             false,
             Vec::new(),
         ));
-        assert_eq!(sum_counters(&second_fin.deltas, "example.com"), Counters { bytes: 54, packets: 1 });
+        assert_eq!(
+            sum_counters(&second_fin.deltas, "example.com"),
+            Counters {
+                bytes: 54,
+                packets: 1
+            }
+        );
         assert_eq!(second_fin.evicted_flows, 1);
         assert_eq!(tracker.active_flows(), 0);
     }
@@ -828,11 +890,23 @@ mod tests {
         tracker.observe(syn(&flow, &client, &server, 11_000_000, 1_000));
         let update = tracker.observe(syn(&flow, &client, &server, 11_000_001, 2_000));
 
-        assert_eq!(sum_counters(&update.deltas, UNKNOWN_DOMAIN), Counters { bytes: 64, packets: 1 });
+        assert_eq!(
+            sum_counters(&update.deltas, UNKNOWN_DOMAIN),
+            Counters {
+                bytes: 64,
+                packets: 1
+            }
+        );
         assert_eq!(tracker.active_flows(), 1);
 
         let remaining = tracker.drain_all();
-        assert_eq!(sum_counters(&remaining, UNKNOWN_DOMAIN), Counters { bytes: 64, packets: 1 });
+        assert_eq!(
+            sum_counters(&remaining, UNKNOWN_DOMAIN),
+            Counters {
+                bytes: 64,
+                packets: 1
+            }
+        );
     }
 
     #[test]
@@ -858,9 +932,24 @@ mod tests {
 
         assert_eq!(update.deltas.len(), 2);
         assert_eq!(update.deltas[0].day_start_utc, 0);
-        assert_eq!(update.deltas[0].counters, Counters { bytes: 64, packets: 1 });
+        assert_eq!(
+            update.deltas[0].counters,
+            Counters {
+                bytes: 64,
+                packets: 1
+            }
+        );
         assert_eq!(update.deltas[1].day_start_utc, 86_400);
-        assert_eq!(update.deltas[1].counters, Counters { bytes: 126, packets: 1 });
-        assert!(update.deltas.iter().all(|delta| delta.domain == "example.com"));
+        assert_eq!(
+            update.deltas[1].counters,
+            Counters {
+                bytes: 126,
+                packets: 1
+            }
+        );
+        assert!(update
+            .deltas
+            .iter()
+            .all(|delta| delta.domain == "example.com"));
     }
 }
