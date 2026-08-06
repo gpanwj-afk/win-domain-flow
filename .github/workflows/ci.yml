@@ -85,9 +85,37 @@ jobs:
           $ErrorActionPreference = "Stop"
           $archive = Join-Path $env:RUNNER_TEMP "npcap-sdk.zip"
           $root = Join-Path $env:RUNNER_TEMP "npcap-sdk"
-          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.16.zip" -OutFile $archive
-          Expand-Archive -Path $archive -DestinationPath $root -Force
+          $url = "https://npcap.com/dist/npcap-sdk-1.16.zip"
 
+          Remove-Item $archive, $root -Recurse -Force -ErrorAction SilentlyContinue
+          $downloaded = $false
+          for ($attempt = 1; $attempt -le 4; $attempt++) {
+            Write-Host "Downloading Npcap SDK, attempt $attempt of 4"
+            Remove-Item $archive -Force -ErrorAction SilentlyContinue
+            & curl.exe `
+              --fail `
+              --location `
+              --retry 5 `
+              --retry-all-errors `
+              --retry-delay 3 `
+              --connect-timeout 20 `
+              --max-time 180 `
+              --output $archive `
+              $url
+
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $archive)) {
+              $size = (Get-Item $archive).Length
+              if ($size -gt 100000) {
+                $downloaded = $true
+                break
+              }
+              Write-Warning "Downloaded archive was unexpectedly small: $size bytes"
+            }
+            Start-Sleep -Seconds (5 * $attempt)
+          }
+          if (-not $downloaded) { throw "Failed to download a valid Npcap SDK archive" }
+
+          Expand-Archive -Path $archive -DestinationPath $root -Force
           $library = Get-ChildItem $root -Recurse -Filter wpcap.lib |
             Where-Object { $_.FullName -match "(?i)(x64|amd64)" } |
             Select-Object -First 1
