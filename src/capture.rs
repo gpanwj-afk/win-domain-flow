@@ -178,8 +178,8 @@ impl PacketSource for LivePacketSource {
         match self.cap.next_packet() {
             Ok(packet) => {
                 let timestamp_micros = timestamp_to_micros(
-                    packet.header.ts.tv_sec.into(),
-                    packet.header.ts.tv_usec.into(),
+                    pcap_time_component_to_i64(packet.header.ts.tv_sec),
+                    pcap_time_component_to_i64(packet.header.ts.tv_usec),
                 )?;
                 let wire_len = packet.header.len;
                 let captured: Box<[u8]> = packet.data.into();
@@ -207,8 +207,8 @@ impl PacketSource for OfflinePacketSource {
         match self.cap.next_packet() {
             Ok(packet) => {
                 let timestamp_micros = timestamp_to_micros(
-                    packet.header.ts.tv_sec.into(),
-                    packet.header.ts.tv_usec.into(),
+                    pcap_time_component_to_i64(packet.header.ts.tv_sec),
+                    pcap_time_component_to_i64(packet.header.ts.tv_usec),
                 )?;
                 let wire_len = packet.header.len;
                 let captured: Box<[u8]> = packet.data.into();
@@ -225,6 +225,11 @@ impl PacketSource for OfflinePacketSource {
             Err(e) => Err(CaptureError::Pcap(e)),
         }
     }
+}
+
+#[allow(clippy::useless_conversion)]
+fn pcap_time_component_to_i64<T: Into<i64>>(value: T) -> i64 {
+    value.into()
 }
 
 fn timestamp_to_micros(tv_sec: i64, tv_usec: i64) -> Result<i64, CaptureError> {

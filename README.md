@@ -24,18 +24,17 @@ This tool provides:
 ## Prerequisites
 
 - **Windows 10/11** (x64)
-- **Npcap** installed (download from https://npcap.com/)
-- **Rust** toolchain (MSVC): `rustup default stable-x86_64-pc-windows-msvc`
-- **Visual Studio Build Tools 2022** with C++ workload
+- **Npcap** installed
+- **Rust 1.88.0** MSVC toolchain
+- **Visual Studio Build Tools 2022** with the C++ workload
 
 ## Building
 
 ```powershell
-# Set Npcap SDK paths
+# Set Npcap SDK paths when they are not already configured system-wide.
 $env:LIB="C:\Npcap-SDK\Lib\x64;$env:LIB"
 $env:INCLUDE="C:\Npcap-SDK\Include;$env:INCLUDE"
 
-# Build
 cargo build --release
 ```
 
@@ -47,10 +46,11 @@ cargo build --release
 .\target\release\win-domain-flow.exe devices
 ```
 
-Output format (TSV):
-```
-name	description
-\Device\NPF_{...}	Network adapter description
+Output format:
+
+```text
+name\tdescription
+\Device\NPF_{...}\tNetwork adapter description
 ```
 
 ### Live Capture
@@ -60,11 +60,12 @@ name	description
 ```
 
 Options:
-- `--interface`: Capture interface name (required)
-- `--db`: Database path (default: `domainflow.db`)
-- `--flush-seconds`: Flush interval 1-60 (default: 1)
-- `--idle-seconds`: Flow idle timeout 1-86400 (default: 300)
-- `--bpf`: BPF filter (default: `tcp port 443 or udp port 443`)
+
+- `--interface`: capture interface name, required
+- `--db`: database path, default `domainflow.db`
+- `--flush-seconds`: flush interval from 1 to 60 seconds, default 1
+- `--idle-seconds`: flow idle timeout from 1 to 86400 seconds, default 300
+- `--bpf`: BPF filter, default `tcp port 443 or udp port 443`
 
 ### Query Top Domains
 
@@ -73,78 +74,63 @@ Options:
 ```
 
 Options:
-- `--db`: Database path (default: `domainflow.db`)
-- `--days`: Look back N days (default: 1)
-- `--limit`: Maximum rows (default: 20)
 
-Output format (TSV):
-```
-domain	bytes	packets
-example.com	123456	789
+- `--db`: database path, default `domainflow.db`
+- `--days`: look back N UTC days, default 1
+- `--limit`: maximum rows, default 20
+
+Output format:
+
+```text
+domain\tbytes\tpackets
+example.com\t123456\t789
 ```
 
 ## Precision Boundaries
 
 ### SNI Extraction Limitations
 
-- **Plaintext TLS ClientHello only**: ECH (Encrypted Client Hello) will not be decoded
-- **Connection reuse**: Sessions that resume or multiplex may show as `(unknown)`
-- **Truncated captures**: Partial ClientHello may not yield SNI
-- **Out-of-order packets**: TCP segments arriving out of order may delay SNI extraction
-- **Pre-existing connections**: Flows established before capture starts may not have SNI
+- **Plaintext TLS ClientHello only**: ECH cannot be decoded.
+- **Connection reuse**: sessions that resume or multiplex may remain attributed to the SNI observed at connection establishment.
+- **Truncated captures**: a ClientHello that exceeds the capture boundary may not yield SNI.
+- **Out-of-order or missing TCP segments**: a sequence gap ends best-effort ClientHello inspection for that connection; its unresolved bytes are recorded as `(unknown)`.
+- **Pre-existing connections**: flows established before capture starts may not expose a ClientHello and may remain `(unknown)`.
 
 ### UDP/443
 
-All UDP/443 traffic is attributed to `(unknown)` since there is no plaintext SNI in UDP-based TLS (QUIC).
+Every UDP/443 packet is attributed immediately to `(unknown)`. TCP and UDP keys include the transport protocol, so an identical endpoint tuple cannot inherit attribution across protocols.
 
 ### Wire Bytes
 
-Reported bytes include all protocol headers (IP, TCP/UDP, Ethernet) and may include retransmissions.
+Reported bytes use the pcap packet header wire length and include link, network, and transport headers. Retransmitted packets are counted because they consumed observed network capacity, while retransmitted TLS payload is not appended twice to the ClientHello parser.
 
-### Database Mergins
+### Database Merging
 
-Multiple capture sessions using the same database file will have their counts merged. Different network interfaces writing to the same DB will also merge.
+Multiple capture sessions using the same database file merge their counts through additive SQLite upserts. Different interfaces writing to the same database also merge because the MVP schema intentionally has no interface dimension.
 
 ## Testing
 
-### Unit Tests
-
-```powershell
-cargo test
-```
-
-### Integration Tests
-
-Requires the pcap fixture at `tests/fixtures/example_tls.pcap` (SHA-256 verified).
-
-```powershell
-cargo test --test offline_pipeline
-```
-
-### Clippy
-
-```powershell
-cargo clippy --all-targets -- -D warnings
-```
-
-### Format Check
-
 ```powershell
 cargo fmt --check
+cargo check --all-targets
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
 ```
+
+The integration fixture is `tests/fixtures/example_tls.pcap`. Its expected SHA-256 is documented in `tests/fixtures/README.md`.
 
 ## Manual Capture
 
-For manual testing with Wireshark's dumpcap:
+For manual testing with Wireshark's `dumpcap`:
 
-```bash
-# List interfaces
+```powershell
 dumpcap.exe -D
-
-# Capture 20 seconds of TLS traffic
 dumpcap.exe -i 1 -f "tcp port 443 or udp port 443" -a duration:20 -F pcap -s 0 -w tests\fixtures\manual_tls.pcap
 ```
 
+Run the application in an elevated terminal when Npcap permissions require it. Generate ordinary HTTPS traffic during capture, stop with Ctrl+C, then query the resulting database with the `top` command.
+
 ## License
 
-This project does not commit to a specific license. See repository for details.
+MIT. See `Cargo.toml` for the package license declaration.
