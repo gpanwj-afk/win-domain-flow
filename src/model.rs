@@ -1,6 +1,8 @@
 use std::net::IpAddr;
 
 pub const UNKNOWN_DOMAIN: &str = "(unknown)";
+pub const UNKNOWN_APPLICATION: &str = "(unknown application)";
+pub const HISTORICAL_APPLICATION: &str = "(historical data)";
 pub const DEFAULT_BPF_FILTER: &str = "tcp port 443 or udp port 443";
 pub const TLS_PORT: u16 = 443;
 pub const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 1;
@@ -89,6 +91,14 @@ pub struct DomainDelta {
     pub counters: Counters,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationDomainDelta {
+    pub day_start_utc: i64,
+    pub application: String,
+    pub domain: String,
+    pub counters: Counters,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FlushBatch {
     pub rows: Vec<DomainDelta>,
@@ -100,11 +110,37 @@ impl FlushBatch {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApplicationFlushBatch {
+    pub rows: Vec<ApplicationDomainDelta>,
+}
+
+impl ApplicationFlushBatch {
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopDomainRow {
     pub domain: String,
     pub bytes: u64,
     pub packets: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopApplicationRow {
+    pub application: String,
+    pub bytes: u64,
+    pub packets: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrafficTotals {
+    pub bytes: u64,
+    pub packets: u64,
+    pub unknown_domain_bytes: u64,
+    pub unknown_application_bytes: u64,
 }
 
 pub fn day_start_utc_from_micros(timestamp_micros: i64) -> i64 {
