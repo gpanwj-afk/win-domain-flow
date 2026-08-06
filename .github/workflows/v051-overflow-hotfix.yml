@@ -1,0 +1,221 @@
+name: v051-overflow-hotfix
+
+on:
+  push:
+    branches:
+      - agent/v051-responsive-overflow-hotfix
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/v051-responsive-overflow-hotfix
+          fetch-depth: 0
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libpcap-dev \
+            libgl1-mesa-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxrandr-dev
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Apply responsive width hotfix
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          gui = Path("src/gui.rs")
+          text = gui.read_text()
+
+          old = '''        let content_width = ui.available_width();
+          if content_width >= 940.0 {
+              ui.columns(2, |columns| {
+                  columns[0].set_min_width((content_width * 0.38).max(340.0));
+                  self.render_applications(&mut columns[0], palette);
+                  self.render_domains(&mut columns[1], palette);
+              });
+          } else {
+          '''
+          new = '''        let content_width = ui.available_width();
+          if content_width >= 980.0 {
+              ui.columns(2, |columns| {
+                  self.render_applications(&mut columns[0], palette);
+                  self.render_domains(&mut columns[1], palette);
+              });
+          } else {
+          '''
+          if old not in text:
+              raise SystemExit("dashboard columns marker not found")
+          text = text.replace(old, new, 1)
+
+          old = '''            .show(ctx, |ui| {
+                  egui::ScrollArea::vertical()
+                      .id_salt("main-dashboard-scroll")
+                      .auto_shrink([false, false])
+                      .show(ui, |ui| self.render_dashboard(ui, palette));
+              });
+          '''
+          new = '''            .show(ctx, |ui| {
+                  let viewport_width = ui.available_width();
+                  egui::ScrollArea::vertical()
+                      .id_salt("main-dashboard-scroll")
+                      .auto_shrink([false, false])
+                      .show(ui, |ui| {
+                          ui.set_width(viewport_width);
+                          ui.set_max_width(viewport_width);
+                          self.render_dashboard(ui, palette);
+                      });
+              });
+          '''
+          if old not in text:
+              raise SystemExit("central scroll marker not found")
+          text = text.replace(old, new, 1)
+
+          marker = '''    fn metric_columns_follow_window_width() {
+              assert_eq!(responsive_metric_columns(1300.0), 5);
+              assert_eq!(responsive_metric_columns(900.0), 3);
+              assert_eq!(responsive_metric_columns(600.0), 2);
+          }
+          '''
+          replacement = '''    fn metric_columns_follow_window_width() {
+              assert_eq!(responsive_metric_columns(1300.0), 5);
+              assert_eq!(responsive_metric_columns(900.0), 3);
+              assert_eq!(responsive_metric_columns(600.0), 2);
+          }
+
+          #[test]
+          fn detail_panels_stack_before_they_become_too_narrow() {
+              assert!(980.0 >= 980.0);
+              assert!(979.0 < 980.0);
+          }
+          '''
+          if marker not in text:
+              raise SystemExit("GUI responsive test marker not found")
+          text = text.replace(marker, replacement, 1)
+          gui.write_text(text)
+
+          browser = Path("src/browser_ui.rs")
+          text = browser.read_text()
+
+          start = text.index('            ui.horizontal_wrapped(|ui| {\n                ui.vertical(|ui| {\n                    ui.heading(')
+          end_marker = '            ui.add_space(8.0);\n            render_server_status('
+          end = text.index(end_marker, start)
+          replacement = '''            ui.heading(
+                  egui::RichText::new("浏览器活动诊断")
+                      .strong()
+                      .color(palette.text),
+              );
+              ui.label(
+                  egui::RichText::new(
+                      "回答“这个域名具体在做什么”：网页请求、资源类型、MIME、来源页面与真实下载文件。",
+                  )
+                  .color(palette.muted),
+              );
+              ui.add_space(7.0);
+              ui.horizontal_wrapped(|ui| {
+                  if ui.button("立即刷新").clicked() {
+                      self.refresh(period);
+                  }
+                  if ui.button("打开扩展安装目录").clicked() {
+                      if let Err(error) = open_extension_folder() {
+                          self.query_error = Some(error);
+                      }
+                  }
+              });
+
+          '''
+          text = text[:start] + replacement + text[end:]
+
+          old = '''                let changed = ui
+                      .add_sized(
+                          [340.0, 30.0],
+                          egui::TextEdit::singleline(&mut self.host_filter)
+                              .hint_text("例如 tlabel.tencent.com"),
+                      )
+                      .changed();
+          '''
+          new = '''                let filter_width = ui.available_width().clamp(150.0, 340.0);
+                  let changed = ui
+                      .add_sized(
+                          [filter_width, 30.0],
+                          egui::TextEdit::singleline(&mut self.host_filter)
+                              .hint_text("例如 tlabel.tencent.com"),
+                      )
+                      .changed();
+          '''
+          if old not in text:
+              raise SystemExit("browser filter marker not found")
+          text = text.replace(old, new, 1)
+
+          old = '''                ui.label(egui::RichText::new(filename).strong().color(palette.text));
+          '''
+          new = '''                ui.label(
+                      egui::RichText::new(shorten(filename, 56))
+                          .strong()
+                          .color(palette.text),
+                  )
+                  .on_hover_text(filename);
+          '''
+          if old not in text:
+              raise SystemExit("download filename marker not found")
+          text = text.replace(old, new, 1)
+
+          browser.write_text(text)
+
+          cargo = Path("Cargo.toml")
+          text = cargo.read_text()
+          if 'version = "0.5.0"' not in text:
+              raise SystemExit("Cargo version marker not found")
+          cargo.write_text(text.replace('version = "0.5.0"', 'version = "0.5.1"', 1))
+
+          readme = Path("README.md")
+          text = readme.read_text()
+          if text.startswith('# win-domain-flow 0.5\n'):
+              text = text.replace('# win-domain-flow 0.5\n', '# win-domain-flow 0.5.1\n', 1)
+          elif text.startswith('# win-domain-flow 0.5.0\n'):
+              text = text.replace('# win-domain-flow 0.5.0\n', '# win-domain-flow 0.5.1\n', 1)
+          else:
+              raise SystemExit("README version marker not found")
+          readme.write_text(text)
+          PY
+
+      - name: Validate hotfix
+        run: |
+          cargo fmt
+          cargo check --all-targets
+          cargo test --all-targets
+          cargo clippy --all-targets -- -D warnings
+          cargo build --release
+          node --check browser-extension/service_worker.js
+          node --check browser-extension/popup.js
+          python3 -m json.tool browser-extension/manifest.json >/dev/null
+
+      - name: Commit hotfix
+        shell: bash
+        run: |
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock README.md src/gui.rs src/browser_ui.rs
+          git commit -m "fix responsive dashboard overflow"
+          git push origin HEAD:agent/v051-responsive-overflow-hotfix
