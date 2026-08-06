@@ -128,7 +128,7 @@ pub fn database_parent(path: &Path) -> PathBuf {
 fn platform_data_root() -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        return std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
     }
 
     #[cfg(not(windows))]
