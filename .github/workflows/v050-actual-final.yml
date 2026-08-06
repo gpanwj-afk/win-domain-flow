@@ -41,7 +41,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Apply validated transformations and stabilize receiver test
+      - name: Apply validated transformations and preserve HTTP CRLF
         shell: bash
         run: |
           python3 - <<'PY'
@@ -91,6 +91,50 @@ jobs:
               text, count = pattern.subn(r'\1None,\n                                    \2', text, count=1)
               if count != 1:
                   raise SystemExit(f"error response call not found: {message}")
+
+          bad_delimiter = 'b"\n\n"'
+          bad_split = 'header_text.split("\n")'
+          if bad_delimiter not in text or bad_split not in text:
+              raise SystemExit("generated HTTP newline literals not found")
+          text = text.replace(bad_delimiter, r'b"\r\n\r\n"', 1)
+          text = text.replace(bad_split, r'header_text.split("\r\n")', 1)
+
+          response_start = text.index("fn write_json_response(")
+          status_start = text.index("fn status_reason", response_start)
+          response_functions = r'''fn write_json_response(
+              stream: &mut TcpStream,
+              status: u16,
+              body: &str,
+              origin: Option<&str>,
+          ) -> Result<(), BrowserActivityError> {
+              let reason = status_reason(status);
+              let cors = cors_headers(origin);
+              let response = format!(
+                  "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n{cors}Access-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n{body}",
+                  body.len()
+              );
+              stream.write_all(response.as_bytes())?;
+              stream.flush()?;
+              Ok(())
+          }
+
+          fn write_empty_response(
+              stream: &mut TcpStream,
+              status: u16,
+              origin: Option<&str>,
+          ) -> Result<(), BrowserActivityError> {
+              let reason = status_reason(status);
+              let cors = cors_headers(origin);
+              let response = format!(
+                  "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n{cors}Access-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n"
+              );
+              stream.write_all(response.as_bytes())?;
+              stream.flush()?;
+              Ok(())
+          }
+
+          '''
+          text = text[:response_start] + response_functions + text[status_start:]
 
           client_pattern = re.compile(
               r'let client = thread::spawn\(move \|\| \{\s*'
