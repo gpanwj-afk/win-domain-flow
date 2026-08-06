@@ -15,14 +15,24 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install libpcap
-        run: sudo apt-get update && sudo apt-get install --yes libpcap-dev
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libpcap-dev \
+            libgl1-mesa-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxrandr-dev
 
       - name: Install Rust 1.88.0
         uses: dtolnay/rust-toolchain@1.88.0
@@ -46,3 +56,9 @@ jobs:
 
       - name: Release build
         run: cargo build --release --locked
+
+      - name: Verify release binaries
+        shell: bash
+        run: |
+          test -f target/release/win-domain-flow
+          test -f target/release/win-domain-flow-gui
