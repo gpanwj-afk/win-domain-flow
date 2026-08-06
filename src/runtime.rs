@@ -89,6 +89,17 @@ pub fn run_live(
         signal_flag.store(true, Ordering::SeqCst);
     })?;
 
+    run_live_with_shutdown(interface, db_path, config, shutdown)
+}
+
+pub fn run_live_with_shutdown(
+    interface: &str,
+    db_path: &Path,
+    config: RuntimeConfig,
+    shutdown: Arc<AtomicBool>,
+) -> Result<RunSummary, RuntimeError> {
+    config.validate()?;
+
     let live_config = crate::capture::LiveCaptureConfig {
         interface: interface.to_string(),
         bpf_filter: config.bpf_filter.clone(),
@@ -100,7 +111,7 @@ pub fn run_live(
     let mut source = crate::capture::open_live(&live_config)?;
     let writer = StorageWriter::spawn(db_path.to_path_buf())?;
 
-    run_source(&mut source, writer, &config, &shutdown, false)
+    run_source(&mut source, writer, &config, shutdown.as_ref(), false)
 }
 
 pub fn run_offline(
