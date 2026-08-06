@@ -1,4 +1,4 @@
-# win-domain-flow 0.5
+# win-domain-flow 0.5.1
 
 Windows 本机应用、域名与浏览器活动诊断工具。
 

@@ -132,30 +132,27 @@ impl BrowserDiagnosticsPane {
         let palette = BrowserPalette::for_theme(theme);
 
         section_card(ui, palette, |ui| {
+            ui.heading(
+                egui::RichText::new("浏览器活动诊断")
+                    .strong()
+                    .color(palette.text),
+            );
+            ui.label(
+        egui::RichText::new(
+            "回答“这个域名具体在做什么”：网页请求、资源类型、MIME、来源页面与真实下载文件。",
+        )
+        .color(palette.muted),
+    );
+            ui.add_space(7.0);
             ui.horizontal_wrapped(|ui| {
-                ui.vertical(|ui| {
-                    ui.heading(
-                        egui::RichText::new("浏览器活动诊断")
-                            .strong()
-                            .color(palette.text),
-                    );
-                    ui.label(
-                        egui::RichText::new(
-                            "回答“这个域名具体在做什么”：网页请求、资源类型、MIME、来源页面与真实下载文件。",
-                        )
-                        .color(palette.muted),
-                    );
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("打开扩展安装目录").clicked() {
-                        if let Err(error) = open_extension_folder() {
-                            self.query_error = Some(error);
-                        }
+                if ui.button("立即刷新").clicked() {
+                    self.refresh(period);
+                }
+                if ui.button("打开扩展安装目录").clicked() {
+                    if let Err(error) = open_extension_folder() {
+                        self.query_error = Some(error);
                     }
-                    if ui.button("立即刷新").clicked() {
-                        self.refresh(period);
-                    }
-                });
+                }
             });
 
             ui.add_space(8.0);
@@ -168,9 +165,10 @@ impl BrowserDiagnosticsPane {
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("域名筛选").color(palette.muted));
+                let filter_width = ui.available_width().clamp(150.0, 340.0);
                 let changed = ui
                     .add_sized(
-                        [340.0, 30.0],
+                        [filter_width, 30.0],
                         egui::TextEdit::singleline(&mut self.host_filter)
                             .hint_text("例如 tlabel.tencent.com"),
                     )
@@ -444,7 +442,12 @@ fn download_card(ui: &mut egui::Ui, row: &BrowserDownloadRow, palette: BrowserPa
                 .and_then(|value| value.to_str())
                 .unwrap_or("文件名尚未确定");
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(filename).strong().color(palette.text));
+                ui.label(
+                    egui::RichText::new(shorten(filename, 56))
+                        .strong()
+                        .color(palette.text),
+                )
+                .on_hover_text(filename);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(
