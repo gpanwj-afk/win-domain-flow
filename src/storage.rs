@@ -8,6 +8,8 @@ use thiserror::Error;
 
 pub const SCHEMA_VERSION: i64 = 1;
 
+const SQLITE_SYNCHRONOUS_NORMAL: i64 = 1;
+
 const SCHEMA_SQL: &str = "
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -146,25 +148,8 @@ impl Storage {
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA_SQL)?;
-
-        let journal_mode: String =
-            conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
-        if journal_mode.to_lowercase() != "wal" {
-            return Err(StorageError::PragmaMismatch("journal_mode is not WAL"));
-        }
-
-        let version_str: String = conn
-            .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")?
-            .query_row([], |row| row.get(0))
-            .map_err(|_| StorageError::InvalidSchemaVersion("not found".to_string()))?;
-
-        let version: i64 = version_str
-            .parse()
-            .map_err(|_| StorageError::InvalidSchemaVersion(version_str))?;
-
-        if version != SCHEMA_VERSION {
-            return Err(StorageError::UnsupportedSchemaVersion(version));
-        }
+        validate_pragmas(&conn)?;
+        validate_schema_version(&conn)?;
 
         Ok(Self { conn })
     }
@@ -176,25 +161,20 @@ impl Storage {
 
         let tx = self.conn.transaction()?;
         {
-            let mut stmt = tx.prepare(UPSERT_SQL)?;
+            let mut statement = tx.prepare(UPSERT_SQL)?;
             for row in &batch.rows {
-                let bytes_i64 = i64::try_from(row.counters.bytes).map_err(|_| {
+                let bytes = i64::try_from(row.counters.bytes).map_err(|_| {
                     StorageError::CounterTooLarge {
                         domain: row.domain.clone(),
                     }
                 })?;
-                let packets_i64 = i64::try_from(row.counters.packets).map_err(|_| {
+                let packets = i64::try_from(row.counters.packets).map_err(|_| {
                     StorageError::CounterTooLarge {
                         domain: row.domain.clone(),
                     }
                 })?;
 
-                stmt.execute(params![
-                    row.day_start_utc,
-                    row.domain,
-                    bytes_i64,
-                    packets_i64
-                ])?;
+                statement.execute(params![row.day_start_utc, row.domain, bytes, packets])?;
             }
         }
         tx.commit()?;
@@ -213,18 +193,7 @@ impl Storage {
             return Err(StorageError::InvalidQuery("limit must be in 1..=1000"));
         }
 
-        let mut stmt = self.conn.prepare(TOP_RECENT_SQL)?;
-        let rows = stmt
-            .query_map(params![days, limit], |row| {
-                Ok(TopDomainRow {
-                    domain: row.get(0)?,
-                    bytes: row.get::<_, i64>(1)? as u64,
-                    packets: row.get::<_, i64>(2)? as u64,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(rows)
+        query_top_rows(&self.conn, TOP_RECENT_SQL, i64::from(days), limit)
     }
 
     pub fn top_domains_since(
@@ -232,7 +201,7 @@ impl Storage {
         min_day_start_utc: i64,
         limit: u32,
     ) -> Result<Vec<TopDomainRow>, StorageError> {
-        if min_day_start_utc % 86400 != 0 {
+        if min_day_start_utc % 86_400 != 0 {
             return Err(StorageError::InvalidQuery(
                 "min_day_start_utc must be divisible by 86400",
             ));
@@ -241,33 +210,68 @@ impl Storage {
             return Err(StorageError::InvalidQuery("limit must be in 1..=1000"));
         }
 
-        let mut stmt = self.conn.prepare(TOP_SINCE_SQL)?;
-        let rows = stmt
-            .query_map(params![min_day_start_utc, limit], |row| {
-                Ok(TopDomainRow {
-                    domain: row.get(0)?,
-                    bytes: row.get::<_, i64>(1)? as u64,
-                    packets: row.get::<_, i64>(2)? as u64,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(rows)
+        query_top_rows(&self.conn, TOP_SINCE_SQL, min_day_start_utc, limit)
     }
 
     pub fn schema_version(&self) -> Result<i64, StorageError> {
-        let version_str: String = self
-            .conn
-            .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")?
-            .query_row([], |row| row.get(0))
-            .map_err(|_| StorageError::InvalidSchemaVersion("not found".to_string()))?;
-
-        let version: i64 = version_str
-            .parse()
-            .map_err(|_| StorageError::InvalidSchemaVersion(version_str))?;
-
-        Ok(version)
+        read_schema_version(&self.conn)
     }
+}
+
+fn validate_pragmas(conn: &Connection) -> Result<(), StorageError> {
+    let journal_mode: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(StorageError::PragmaMismatch("journal_mode is not WAL"));
+    }
+
+    let synchronous: i64 = conn.pragma_query_value(None, "synchronous", |row| row.get(0))?;
+    if synchronous != SQLITE_SYNCHRONOUS_NORMAL {
+        return Err(StorageError::PragmaMismatch(
+            "synchronous is not NORMAL",
+        ));
+    }
+
+    Ok(())
+}
+
+fn read_schema_version(conn: &Connection) -> Result<i64, StorageError> {
+    let version_text: String = conn
+        .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")?
+        .query_row([], |row| row.get(0))
+        .map_err(|_| StorageError::InvalidSchemaVersion("not found".to_string()))?;
+
+    version_text
+        .parse()
+        .map_err(|_| StorageError::InvalidSchemaVersion(version_text))
+}
+
+fn validate_schema_version(conn: &Connection) -> Result<(), StorageError> {
+    let version = read_schema_version(conn)?;
+    if version != SCHEMA_VERSION {
+        return Err(StorageError::UnsupportedSchemaVersion(version));
+    }
+    Ok(())
+}
+
+fn query_top_rows(
+    conn: &Connection,
+    sql: &str,
+    lower_bound: i64,
+    limit: u32,
+) -> Result<Vec<TopDomainRow>, StorageError> {
+    let mut statement = conn.prepare(sql)?;
+    let rows = statement
+        .query_map(params![lower_bound, limit], |row| {
+            let bytes = row.get::<_, i64>(1)?;
+            let packets = row.get::<_, i64>(2)?;
+            Ok(TopDomainRow {
+                domain: row.get(0)?,
+                bytes: u64::try_from(bytes).unwrap_or(0),
+                packets: u64::try_from(packets).unwrap_or(0),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 enum WriterCommand {
@@ -283,7 +287,7 @@ pub struct StorageWriter {
 
 impl StorageWriter {
     pub fn spawn(path: PathBuf) -> Result<Self, StorageError> {
-        let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel(4);
+        let (command_tx, command_rx) = std::sync::mpsc::sync_channel(4);
         let (error_tx, error_rx) = std::sync::mpsc::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
@@ -291,46 +295,46 @@ impl StorageWriter {
             .name("domainflow-db-writer".to_string())
             .spawn(move || {
                 let mut storage = match Storage::open(&path) {
-                    Ok(s) => {
+                    Ok(storage) => {
                         let _ = ready_tx.send(Ok(()));
-                        s
+                        storage
                     }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e.to_string()));
-                        return Err(StorageError::WriterChannelClosed);
+                    Err(error) => {
+                        let message = error.to_string();
+                        let _ = ready_tx.send(Err(message.clone()));
+                        return Err(StorageError::WriterFailed(message));
                     }
                 };
 
                 loop {
-                    match cmd_rx.recv() {
+                    match command_rx.recv() {
                         Ok(WriterCommand::Write(batch)) => {
-                            if let Err(e) = storage.upsert_batch(&batch) {
-                                let _ = error_tx.send(e.to_string());
-                                return Err(StorageError::WriterFailed(e.to_string()));
+                            if let Err(error) = storage.upsert_batch(&batch) {
+                                let message = error.to_string();
+                                let _ = error_tx.send(message.clone());
+                                return Err(StorageError::WriterFailed(message));
                             }
                         }
-                        Ok(WriterCommand::Shutdown) => {
-                            return Ok(());
-                        }
-                        Err(_) => {
-                            return Ok(());
-                        }
+                        Ok(WriterCommand::Shutdown) | Err(_) => return Ok(()),
                     }
                 }
             })
-            .map_err(|e| StorageError::WriterFailed(e.to_string()))?;
+            .map_err(|error| StorageError::WriterFailed(error.to_string()))?;
 
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
-                tx: cmd_tx,
+                tx: command_tx,
                 error_rx,
                 handle: Some(handle),
             }),
-            Ok(Err(e)) => {
+            Ok(Err(error)) => {
                 let _ = handle.join();
-                Err(StorageError::WriterFailed(e))
+                Err(StorageError::WriterFailed(error))
             }
-            Err(_) => Err(StorageError::WriterChannelClosed),
+            Err(_) => {
+                let _ = handle.join();
+                Err(StorageError::WriterChannelClosed)
+            }
         }
     }
 
@@ -339,8 +343,8 @@ impl StorageWriter {
             return Ok(());
         }
 
-        if let Ok(err) = self.error_rx.try_recv() {
-            return Err(StorageError::WriterFailed(err));
+        if let Ok(error) = self.error_rx.try_recv() {
+            return Err(StorageError::WriterFailed(error));
         }
 
         self.tx
@@ -353,23 +357,23 @@ impl StorageWriter {
     }
 
     pub fn shutdown(mut self) -> Result<(), StorageError> {
-        let err = self.error_rx.try_recv().ok();
-
+        let reported_error = self.error_rx.try_recv().ok();
         let _ = self.tx.send(WriterCommand::Shutdown);
 
-        if let Some(handle) = self.handle.take() {
-            match handle.join() {
-                Ok(Ok(())) => {
-                    if let Some(e) = err {
-                        return Err(StorageError::WriterFailed(e));
-                    }
+        let Some(handle) = self.handle.take() else {
+            return Err(StorageError::WriterPanicked);
+        };
+
+        match handle.join() {
+            Ok(Ok(())) => {
+                if let Some(error) = reported_error {
+                    Err(StorageError::WriterFailed(error))
+                } else {
                     Ok(())
                 }
-                Ok(Err(e)) => Err(e),
-                Err(_) => Err(StorageError::WriterPanicked),
             }
-        } else {
-            Err(StorageError::WriterPanicked)
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(StorageError::WriterPanicked),
         }
     }
 }
@@ -377,13 +381,13 @@ impl StorageWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Counters, DomainDelta};
     use std::fs;
-    use std::path::PathBuf;
 
     fn temp_db_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         let id = format!(
-            "{}_{}_{}",
+            "storage_test_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -400,25 +404,34 @@ mod tests {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(path.with_extension("db-wal"));
         let _ = fs::remove_file(path.with_extension("db-shm"));
-        if let Some(parent) = path.parent() {
-            if parent != std::env::temp_dir() {
-                let _ = fs::remove_dir(parent);
-            }
+    }
+
+    fn delta(day_start_utc: i64, domain: &str, bytes: u64, packets: u64) -> DomainDelta {
+        DomainDelta {
+            day_start_utc,
+            domain: domain.to_string(),
+            counters: Counters { bytes, packets },
         }
     }
 
     #[test]
-    fn schema_is_version_one_and_wal() {
+    fn schema_is_version_one_wal_and_normal_synchronous() {
         let path = temp_db_path("schema");
         let storage = Storage::open(&path).unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 1);
 
+        assert_eq!(storage.schema_version().unwrap(), 1);
         let journal_mode: String = storage
             .conn
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .unwrap();
+        let synchronous: i64 = storage
+            .conn
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
         assert_eq!(journal_mode.to_lowercase(), "wal");
+        assert_eq!(synchronous, SQLITE_SYNCHRONOUS_NORMAL);
 
+        drop(storage);
         cleanup_db(&path);
     }
 
@@ -427,35 +440,23 @@ mod tests {
         let path = temp_db_path("upsert_add");
         let mut storage = Storage::open(&path).unwrap();
 
-        let batch1 = FlushBatch {
-            rows: vec![crate::model::DomainDelta {
-                day_start_utc: 86400,
-                domain: "example.com".to_string(),
-                counters: crate::model::Counters {
-                    bytes: 100,
-                    packets: 1,
-                },
-            }],
-        };
-        storage.upsert_batch(&batch1).unwrap();
-
-        let batch2 = FlushBatch {
-            rows: vec![crate::model::DomainDelta {
-                day_start_utc: 86400,
-                domain: "example.com".to_string(),
-                counters: crate::model::Counters {
-                    bytes: 50,
-                    packets: 2,
-                },
-            }],
-        };
-        storage.upsert_batch(&batch2).unwrap();
+        storage
+            .upsert_batch(&FlushBatch {
+                rows: vec![delta(86_400, "example.com", 100, 1)],
+            })
+            .unwrap();
+        storage
+            .upsert_batch(&FlushBatch {
+                rows: vec![delta(86_400, "example.com", 50, 2)],
+            })
+            .unwrap();
 
         let rows = storage.top_domains_since(0, 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].bytes, 150);
         assert_eq!(rows[0].packets, 3);
 
+        drop(storage);
         cleanup_db(&path);
     }
 
@@ -463,78 +464,54 @@ mod tests {
     fn upsert_separates_days() {
         let path = temp_db_path("upsert_days");
         let mut storage = Storage::open(&path).unwrap();
+        storage
+            .upsert_batch(&FlushBatch {
+                rows: vec![
+                    delta(86_400, "example.com", 100, 1),
+                    delta(172_800, "example.com", 200, 2),
+                ],
+            })
+            .unwrap();
 
-        let batch = FlushBatch {
-            rows: vec![
-                crate::model::DomainDelta {
-                    day_start_utc: 86400,
-                    domain: "example.com".to_string(),
-                    counters: crate::model::Counters {
-                        bytes: 100,
-                        packets: 1,
-                    },
-                },
-                crate::model::DomainDelta {
-                    day_start_utc: 172800,
-                    domain: "example.com".to_string(),
-                    counters: crate::model::Counters {
-                        bytes: 200,
-                        packets: 2,
-                    },
-                },
-            ],
-        };
-        storage.upsert_batch(&batch).unwrap();
+        let count: i64 = storage
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM domain_daily WHERE domain = 'example.com'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
 
         let rows = storage.top_domains_since(0, 10).unwrap();
-        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].bytes, 300);
         assert_eq!(rows[0].packets, 3);
 
+        drop(storage);
         cleanup_db(&path);
     }
 
     #[test]
-    fn top_domains_orders_by_bytes_then_domain() {
+    fn top_domains_orders_equal_bytes_by_domain() {
         let path = temp_db_path("top_order");
         let mut storage = Storage::open(&path).unwrap();
-
-        let batch = FlushBatch {
-            rows: vec![
-                crate::model::DomainDelta {
-                    day_start_utc: 86400,
-                    domain: "a.com".to_string(),
-                    counters: crate::model::Counters {
-                        bytes: 100,
-                        packets: 1,
-                    },
-                },
-                crate::model::DomainDelta {
-                    day_start_utc: 86400,
-                    domain: "b.com".to_string(),
-                    counters: crate::model::Counters {
-                        bytes: 200,
-                        packets: 2,
-                    },
-                },
-                crate::model::DomainDelta {
-                    day_start_utc: 86400,
-                    domain: "c.com".to_string(),
-                    counters: crate::model::Counters {
-                        bytes: 150,
-                        packets: 1,
-                    },
-                },
-            ],
-        };
-        storage.upsert_batch(&batch).unwrap();
+        storage
+            .upsert_batch(&FlushBatch {
+                rows: vec![
+                    delta(86_400, "b.com", 200, 2),
+                    delta(86_400, "a.com", 200, 1),
+                    delta(86_400, "c.com", 150, 1),
+                ],
+            })
+            .unwrap();
 
         let rows = storage.top_domains_since(0, 10).unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].domain, "b.com");
-        assert_eq!(rows[1].domain, "c.com");
-        assert_eq!(rows[2].domain, "a.com");
+        assert_eq!(rows[0].domain, "a.com");
+        assert_eq!(rows[1].domain, "b.com");
+        assert_eq!(rows[2].domain, "c.com");
 
+        drop(storage);
         cleanup_db(&path);
     }
 
@@ -542,13 +519,10 @@ mod tests {
     fn empty_batch_is_noop() {
         let path = temp_db_path("empty_batch");
         let mut storage = Storage::open(&path).unwrap();
+        storage.upsert_batch(&FlushBatch { rows: Vec::new() }).unwrap();
+        assert!(storage.top_domains_since(0, 10).unwrap().is_empty());
 
-        let batch = FlushBatch { rows: vec![] };
-        storage.upsert_batch(&batch).unwrap();
-
-        let rows = storage.top_domains_since(0, 10).unwrap();
-        assert!(rows.is_empty());
-
+        drop(storage);
         cleanup_db(&path);
     }
 
@@ -556,18 +530,11 @@ mod tests {
     fn writer_flushes_before_shutdown() {
         let path = temp_db_path("writer_flush");
         let writer = StorageWriter::spawn(path.clone()).unwrap();
-
-        let batch = FlushBatch {
-            rows: vec![crate::model::DomainDelta {
-                day_start_utc: 86400,
-                domain: "example.com".to_string(),
-                counters: crate::model::Counters {
-                    bytes: 100,
-                    packets: 1,
-                },
-            }],
-        };
-        writer.submit(batch).unwrap();
+        writer
+            .submit(FlushBatch {
+                rows: vec![delta(86_400, "example.com", 100, 1)],
+            })
+            .unwrap();
         writer.shutdown().unwrap();
 
         let storage = Storage::open(&path).unwrap();
@@ -575,6 +542,24 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].bytes, 100);
 
+        drop(storage);
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn counter_larger_than_sqlite_integer_is_rejected() {
+        let path = temp_db_path("counter_limit");
+        let mut storage = Storage::open(&path).unwrap();
+        let result = storage.upsert_batch(&FlushBatch {
+            rows: vec![delta(86_400, "example.com", u64::MAX, 1)],
+        });
+
+        assert!(matches!(
+            result,
+            Err(StorageError::CounterTooLarge { .. })
+        ));
+
+        drop(storage);
         cleanup_db(&path);
     }
 
@@ -587,22 +572,20 @@ mod tests {
             storage.top_domains_recent(0, 10),
             Err(StorageError::InvalidQuery(_))
         ));
-
         assert!(matches!(
             storage.top_domains_recent(1, 0),
             Err(StorageError::InvalidQuery(_))
         ));
-
         assert!(matches!(
             storage.top_domains_since(1, 10),
             Err(StorageError::InvalidQuery(_))
         ));
-
         assert!(matches!(
             storage.top_domains_since(0, 0),
             Err(StorageError::InvalidQuery(_))
         ));
 
+        drop(storage);
         cleanup_db(&path);
     }
 }
