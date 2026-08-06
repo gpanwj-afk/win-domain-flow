@@ -255,14 +255,12 @@ impl ApplicationStorage {
                 params![lower_bound, application, i64::from(limit)],
                 map_domain_row,
             )?;
-            let collected = mapped.collect::<Result<Vec<_>, _>>()?;
-            collected
+            mapped.collect::<Result<Vec<_>, _>>()?
         } else {
             let mut statement = self.conn.prepare(TOP_DOMAINS_ALL_SQL)?;
             let mapped =
                 statement.query_map(params![lower_bound, i64::from(limit)], map_domain_row)?;
-            let collected = mapped.collect::<Result<Vec<_>, _>>()?;
-            collected
+            mapped.collect::<Result<Vec<_>, _>>()?
         };
         Ok(rows)
     }
@@ -348,6 +346,7 @@ fn migrate_historical_rows(conn: &mut Connection) -> Result<(), ApplicationStora
          )
          SELECT day_start_utc, ?1, domain, bytes, packets, updated_at_utc
          FROM domain_daily
+         WHERE true
          ON CONFLICT(day_start_utc, application, domain) DO NOTHING",
         [HISTORICAL_APPLICATION],
     )?;
