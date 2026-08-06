@@ -1,0 +1,34 @@
+[package]
+name = "win-domain-flow"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+description = "Lightweight Windows domain-level network byte monitor"
+repository = "https://example.invalid/win-domain-flow"
+publish = false
+
+[lib]
+name = "win_domain_flow"
+path = "src/lib.rs"
+
+[[bin]]
+name = "win-domain-flow"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "=1.0.101"
+clap = { version = "=4.6.5", features = ["derive"] }
+ctrlc = { version = "=3.5.2", features = ["termination"] }
+etherparse = "=0.21.0"
+pcap = "=2.4.0"
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+thiserror = "=2.0.18"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

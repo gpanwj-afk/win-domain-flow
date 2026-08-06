@@ -1,0 +1,14 @@
+/target/
+*.pdb
+*.ilk
+*.exp
+*.dll
+*.db
+*.db-shm
+*.db-wal
+*.log
+/tests/tmp/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
