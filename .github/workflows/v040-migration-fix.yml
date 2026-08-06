@@ -44,50 +44,29 @@ jobs:
 
           path = Path("src/app_storage.rs")
           text = path.read_text()
-          old = '''    if current.as_deref() == Some(APP_SCHEMA_VERSION) {
-              return Ok(());
-          }
+          function_start = text.index("fn migrate_historical_rows")
+          block_start = text.index("    let tx = conn.transaction()?;", function_start)
+          schema_marker = '    tx.execute(\n        "INSERT INTO schema_meta'
+          block_end = text.index(schema_marker, block_start)
+          execute_start = text.index("    tx.execute(", block_start)
+          execute_block = text[execute_start:block_end]
+          indented_execute = "".join(
+              ("    " + line) if line.strip() else line
+              for line in execute_block.splitlines(keepends=True)
+          )
+          replacement = (
+              "    let should_import_legacy_totals = current.is_none();\n"
+              "    let tx = conn.transaction()?;\n"
+              "    if should_import_legacy_totals {\n"
+              + indented_execute
+              + "    }\n"
+          )
+          text = text[:block_start] + replacement + text[block_end:]
 
-          let tx = conn.transaction()?;
-          tx.execute(
-              "INSERT INTO application_domain_daily (
-                  day_start_utc, application, domain, bytes, packets, updated_at_utc
-               )
-               SELECT day_start_utc, ?1, domain, bytes, packets, updated_at_utc
-               FROM domain_daily
-               WHERE true
-               ON CONFLICT(day_start_utc, application, domain) DO NOTHING",
-              [HISTORICAL_APPLICATION],
-          )?;
-          tx.execute(
-          '''
-          new = '''    if current.as_deref() == Some(APP_SCHEMA_VERSION) {
-              return Ok(());
-          }
-
-          let should_import_legacy_totals = current.is_none();
-          let tx = conn.transaction()?;
-          if should_import_legacy_totals {
-              tx.execute(
-                  "INSERT INTO application_domain_daily (
-                      day_start_utc, application, domain, bytes, packets, updated_at_utc
-                   )
-                   SELECT day_start_utc, ?1, domain, bytes, packets, updated_at_utc
-                   FROM domain_daily
-                   WHERE true
-                   ON CONFLICT(day_start_utc, application, domain) DO NOTHING",
-                  [HISTORICAL_APPLICATION],
-              )?;
-          }
-          tx.execute(
-          '''
-          if old not in text:
-              raise SystemExit("migration block not found")
-          text = text.replace(old, new, 1)
-
-          marker = '''    #[test]
-          fn application_rows_and_details_are_additive_and_queryable() {
-          '''
+          marker = (
+              "    #[test]\n"
+              "    fn application_rows_and_details_are_additive_and_queryable() {\n"
+          )
           test = '''    #[test]
           fn v03_upgrade_does_not_reimport_domain_totals() {
               let path = temp_db_path("v03_upgrade");
