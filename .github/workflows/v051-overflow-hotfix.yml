@@ -46,84 +46,64 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           gui = Path("src/gui.rs")
           text = gui.read_text()
 
-          old = '''        let content_width = ui.available_width();
-          if content_width >= 940.0 {
-              ui.columns(2, |columns| {
-                  columns[0].set_min_width((content_width * 0.38).max(340.0));
-                  self.render_applications(&mut columns[0], palette);
-                  self.render_domains(&mut columns[1], palette);
-              });
-          } else {
-          '''
-          new = '''        let content_width = ui.available_width();
-          if content_width >= 980.0 {
-              ui.columns(2, |columns| {
-                  self.render_applications(&mut columns[0], palette);
-                  self.render_domains(&mut columns[1], palette);
-              });
-          } else {
-          '''
-          if old not in text:
-              raise SystemExit("dashboard columns marker not found")
-          text = text.replace(old, new, 1)
+          if 'if content_width >= 940.0 {' not in text:
+              raise SystemExit("dashboard threshold marker not found")
+          text = text.replace('if content_width >= 940.0 {', 'if content_width >= 980.0 {', 1)
 
-          old = '''            .show(ctx, |ui| {
-                  egui::ScrollArea::vertical()
-                      .id_salt("main-dashboard-scroll")
-                      .auto_shrink([false, false])
-                      .show(ui, |ui| self.render_dashboard(ui, palette));
-              });
-          '''
-          new = '''            .show(ctx, |ui| {
-                  let viewport_width = ui.available_width();
-                  egui::ScrollArea::vertical()
-                      .id_salt("main-dashboard-scroll")
-                      .auto_shrink([false, false])
-                      .show(ui, |ui| {
+          min_width_pattern = re.compile(
+              r'\n\s*columns\[0\]\.set_min_width\(\(content_width \* 0\.38\)\.max\(340\.0\)\);'
+          )
+          text, count = min_width_pattern.subn('', text, count=1)
+          if count != 1:
+              raise SystemExit("forced first-column min width not found")
+
+          old = '.show(ui, |ui| self.render_dashboard(ui, palette));'
+          new = '''.show(ui, |ui| {
                           ui.set_width(viewport_width);
                           ui.set_max_width(viewport_width);
                           self.render_dashboard(ui, palette);
-                      });
-              });
-          '''
+                      });'''
           if old not in text:
-              raise SystemExit("central scroll marker not found")
+              raise SystemExit("dashboard scroll render marker not found")
           text = text.replace(old, new, 1)
 
-          marker = '''    fn metric_columns_follow_window_width() {
-              assert_eq!(responsive_metric_columns(1300.0), 5);
-              assert_eq!(responsive_metric_columns(900.0), 3);
-              assert_eq!(responsive_metric_columns(600.0), 2);
-          }
-          '''
-          replacement = '''    fn metric_columns_follow_window_width() {
-              assert_eq!(responsive_metric_columns(1300.0), 5);
-              assert_eq!(responsive_metric_columns(900.0), 3);
-              assert_eq!(responsive_metric_columns(600.0), 2);
-          }
+          scroll_marker = '''            .show(ctx, |ui| {
+                  egui::ScrollArea::vertical()'''
+          if scroll_marker in text:
+              text = text.replace(
+                  scroll_marker,
+                  '''            .show(ctx, |ui| {
+                  let viewport_width = ui.available_width();
+                  egui::ScrollArea::vertical()''',
+                  1,
+              )
+          else:
+              pattern = re.compile(
+                  r'(\.show\(ctx, \|ui\| \{\s*)(egui::ScrollArea::vertical\(\)\s*'
+                  r'\.id_salt\("main-dashboard-scroll"\))',
+                  re.S,
+              )
+              text, count = pattern.subn(
+                  r'\1let viewport_width = ui.available_width();\n                \2',
+                  text,
+                  count=1,
+              )
+              if count != 1:
+                  raise SystemExit("central viewport insertion marker not found")
 
-          #[test]
-          fn detail_panels_stack_before_they_become_too_narrow() {
-              assert!(980.0 >= 980.0);
-              assert!(979.0 < 980.0);
-          }
-          '''
-          if marker not in text:
-              raise SystemExit("GUI responsive test marker not found")
-          text = text.replace(marker, replacement, 1)
           gui.write_text(text)
 
           browser = Path("src/browser_ui.rs")
           text = browser.read_text()
 
-          start = text.index('            ui.horizontal_wrapped(|ui| {\n                ui.vertical(|ui| {\n                    ui.heading(')
-          end_marker = '            ui.add_space(8.0);\n            render_server_status('
-          end = text.index(end_marker, start)
-          replacement = '''            ui.heading(
+          header_start = text.index('            ui.horizontal_wrapped(|ui| {\n                ui.vertical(|ui| {\n                    ui.heading(')
+          header_end = text.index('            ui.add_space(8.0);\n            render_server_status(', header_start)
+          header = '''            ui.heading(
                   egui::RichText::new("浏览器活动诊断")
                       .strong()
                       .color(palette.text),
@@ -147,41 +127,36 @@ jobs:
               });
 
           '''
-          text = text[:start] + replacement + text[end:]
+          text = text[:header_start] + header + text[header_end:]
 
-          old = '''                let changed = ui
-                      .add_sized(
-                          [340.0, 30.0],
-                          egui::TextEdit::singleline(&mut self.host_filter)
-                              .hint_text("例如 tlabel.tencent.com"),
-                      )
-                      .changed();
-          '''
-          new = '''                let filter_width = ui.available_width().clamp(150.0, 340.0);
-                  let changed = ui
-                      .add_sized(
-                          [filter_width, 30.0],
-                          egui::TextEdit::singleline(&mut self.host_filter)
-                              .hint_text("例如 tlabel.tencent.com"),
-                      )
-                      .changed();
-          '''
-          if old not in text:
-              raise SystemExit("browser filter marker not found")
-          text = text.replace(old, new, 1)
+          filter_pattern = re.compile(
+              r'(ui\.label\(egui::RichText::new\("域名筛选"\)\.color\(palette\.muted\)\);\s*)'
+              r'(let changed = ui\s*\.add_sized\(\s*)\[340\.0, 30\.0\],',
+              re.S,
+          )
+          text, count = filter_pattern.subn(
+              r'\1let filter_width = ui.available_width().clamp(150.0, 340.0);\n                \2[filter_width, 30.0],',
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("browser filter width marker not found")
 
-          old = '''                ui.label(egui::RichText::new(filename).strong().color(palette.text));
-          '''
-          new = '''                ui.label(
+          filename_pattern = re.compile(
+              r'ui\.label\(egui::RichText::new\(filename\)\.strong\(\)\.color\(palette\.text\)\);'
+          )
+          text, count = filename_pattern.subn(
+              '''ui.label(
                       egui::RichText::new(shorten(filename, 56))
                           .strong()
                           .color(palette.text),
                   )
-                  .on_hover_text(filename);
-          '''
-          if old not in text:
+                  .on_hover_text(filename);''',
+              text,
+              count=1,
+          )
+          if count != 1:
               raise SystemExit("download filename marker not found")
-          text = text.replace(old, new, 1)
 
           browser.write_text(text)
 
