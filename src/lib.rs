@@ -3,6 +3,7 @@ pub mod attribution;
 pub mod capture;
 pub mod cli;
 pub mod flow;
+pub mod gui;
 pub mod model;
 pub mod packet;
 pub mod runtime;
