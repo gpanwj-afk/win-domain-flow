@@ -113,3 +113,16 @@ jobs:
           $root = "target\x86_64-pc-windows-msvc\release"
           if (!(Test-Path "$root\win-domain-flow.exe")) { throw "CLI executable missing" }
           if (!(Test-Path "$root\win-domain-flow-gui.exe")) { throw "GUI executable missing" }
+
+      - name: Upload Windows x64 package
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-domain-flow-windows-x64
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            target/x86_64-pc-windows-msvc/release/win-domain-flow.exe
+            target/x86_64-pc-windows-msvc/release/win-domain-flow-gui.exe
+            README.md
+            INSTALL.md
+            INSTALL_CN.md
