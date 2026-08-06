@@ -1,0 +1,78 @@
+name: productize-bootstrap
+
+on:
+  push:
+    branches:
+      - agent/productize-cn-app-dashboard
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/productize-cn-app-dashboard
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt
+      - name: Wire product modules and refresh lockfile
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          lib = Path('src/lib.rs')
+          text = lib.read_text()
+          for module in ['app_runtime', 'app_tracker']:
+              line = f'pub mod {module};\n'
+              if line not in text:
+                  text = text.replace('pub mod app_storage;\n', f'pub mod app_storage;\n{line}', 1)
+          lib.write_text(text)
+
+          gui = Path('src/gui.rs')
+          text = gui.read_text()
+          old = 'use crate::runtime::{run_live_with_shutdown, RunSummary, RuntimeConfig};\n'
+          new = ('use crate::app_runtime::{run_live_with_shutdown, ApplicationRunSummary};\n'
+                 'use crate::runtime::RuntimeConfig;\n')
+          if old not in text:
+              raise SystemExit('GUI runtime import marker not found')
+          text = text.replace(old, new, 1)
+          text = text.replace('Result<RunSummary, String>', 'Result<ApplicationRunSummary, String>')
+          text = text.replace('last_summary: Option<RunSummary>', 'last_summary: Option<ApplicationRunSummary>')
+          gui.write_text(text)
+
+          app_storage = Path('src/app_storage.rs')
+          text = app_storage.read_text()
+          text = text.replace('let conn = Connection::open(path)?;', 'let mut conn = Connection::open(path)?;', 1)
+          old = 'migrate_historical_rows(&mut conn.try_clone()?)?;'
+          if old not in text:
+              raise SystemExit('application storage migration marker not found')
+          text = text.replace(old, 'migrate_historical_rows(&mut conn)?;', 1)
+          app_storage.write_text(text)
+
+          settings = Path('src/settings.rs')
+          text = settings.read_text()
+          text = text.replace('use std::ffi::OsString;\n', '')
+          start = text.find('\n#[allow(dead_code)]\nfn _os_string_round_trip')
+          if start != -1:
+              end = text.find('\n#[cfg(test)]', start)
+              text = text[:start] + '\n' + text[end:]
+          settings.write_text(text)
+          PY
+          cargo fmt
+          cargo generate-lockfile
+          git diff --check
+      - name: Commit generated integration
+        shell: bash
+        run: |
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src Cargo.lock
+            git commit -m "wire application dashboard runtime"
+            git push
+          fi
