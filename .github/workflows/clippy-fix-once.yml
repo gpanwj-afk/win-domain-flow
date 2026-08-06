@@ -1,0 +1,74 @@
+name: clippy-fix-once
+
+on:
+  push:
+    branches:
+      - agent/fix-domain-attribution
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/fix-domain-attribution
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt
+      - name: Apply targeted fixes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          capture = Path("src/capture.rs")
+          text = capture.read_text()
+          text = text.replace(
+              "packet.header.ts.tv_sec.into(),",
+              "pcap_time_component_to_i64(packet.header.ts.tv_sec),",
+          )
+          text = text.replace(
+              "packet.header.ts.tv_usec.into(),",
+              "pcap_time_component_to_i64(packet.header.ts.tv_usec),",
+          )
+          marker = "fn timestamp_to_micros(tv_sec: i64, tv_usec: i64) -> Result<i64, CaptureError> {"
+          helper = """#[allow(clippy::useless_conversion)]
+          fn pcap_time_component_to_i64<T: Into<i64>>(value: T) -> i64 {
+              value.into()
+          }
+
+          """
+          if marker not in text:
+              raise SystemExit("capture timestamp marker not found")
+          if "fn pcap_time_component_to_i64" not in text:
+              text = text.replace(marker, helper + marker, 1)
+          capture.write_text(text)
+
+          flow = Path("src/flow.rs")
+          text = flow.read_text()
+          old = """                let Some(new_len) = assembler.bytes.len().checked_add(tcp.payload.len()) else {
+                              return None;
+                          };
+          """
+          new = """                let new_len = assembler.bytes.len().checked_add(tcp.payload.len())?;
+          """
+          if old not in text:
+              raise SystemExit("flow checked_add marker not found")
+          flow.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt
+          git diff --check
+      - name: Commit fixes
+        shell: bash
+        run: |
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src/capture.rs src/flow.rs
+            git commit -m "fix clippy findings"
+            git push
+          fi
