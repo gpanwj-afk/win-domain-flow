@@ -13,9 +13,9 @@ permissions:
   contents: read
 
 jobs:
-  rust:
+  linux-quality:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
       - name: Checkout
@@ -58,7 +58,58 @@ jobs:
         run: cargo build --release --locked
 
       - name: Verify release binaries
-        shell: bash
         run: |
           test -f target/release/win-domain-flow
           test -f target/release/win-domain-flow-gui
+
+  windows-product:
+    runs-on: windows-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.88.0 MSVC
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Npcap SDK 1.16
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archive = Join-Path $env:RUNNER_TEMP "npcap-sdk.zip"
+          $root = Join-Path $env:RUNNER_TEMP "npcap-sdk"
+          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.16.zip" -OutFile $archive
+          Expand-Archive -Path $archive -DestinationPath $root -Force
+
+          $library = Get-ChildItem $root -Recurse -Filter wpcap.lib |
+            Where-Object { $_.FullName -match "(?i)(x64|amd64)" } |
+            Select-Object -First 1
+          $header = Get-ChildItem $root -Recurse -Filter pcap.h | Select-Object -First 1
+          if (-not $library) { throw "Npcap x64 wpcap.lib not found" }
+          if (-not $header) { throw "Npcap pcap.h not found" }
+
+          "LIB=$($library.DirectoryName);$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "INCLUDE=$($header.DirectoryName);$env:INCLUDE" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Check Windows targets
+        run: cargo check --all-targets --locked --target x86_64-pc-windows-msvc
+
+      - name: Clippy Windows targets
+        run: cargo clippy --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
+
+      - name: Release build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Verify Windows executables
+        shell: pwsh
+        run: |
+          $root = "target\x86_64-pc-windows-msvc\release"
+          if (!(Test-Path "$root\win-domain-flow.exe")) { throw "CLI executable missing" }
+          if (!(Test-Path "$root\win-domain-flow-gui.exe")) { throw "GUI executable missing" }
