@@ -2,11 +2,11 @@ use crate::app_runtime::{run_live_with_shutdown, ApplicationRunSummary};
 use crate::app_storage::{ApplicationStorage, TrafficPeriod};
 use crate::capture::{list_devices, CaptureDeviceInfo};
 use crate::model::{
-    TopApplicationRow, TopDomainRow, TrafficTotals, HISTORICAL_APPLICATION, UNKNOWN_APPLICATION,
-    UNKNOWN_DOMAIN,
+    TopApplicationRow, TopDomainDetailRow, TrafficBreakdown, TrafficTotals,
+    HISTORICAL_APPLICATION, UNKNOWN_APPLICATION, UNKNOWN_DOMAIN,
 };
 use crate::runtime::RuntimeConfig;
-use crate::settings::{database_parent, product_data_dir, AppSettings};
+use crate::settings::{database_parent, product_data_dir, AppSettings, ThemeMode};
 use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,24 +17,72 @@ use std::time::{Duration, Instant};
 
 const APP_TITLE: &str = "域流量管家";
 const UI_TICK: Duration = Duration::from_millis(250);
-const BG: egui::Color32 = egui::Color32::from_rgb(15, 23, 42);
-const PANEL: egui::Color32 = egui::Color32::from_rgb(23, 32, 51);
-const CARD: egui::Color32 = egui::Color32::from_rgb(30, 41, 59);
-const CARD_HOVER: egui::Color32 = egui::Color32::from_rgb(38, 52, 75);
-const BORDER: egui::Color32 = egui::Color32::from_rgb(55, 70, 94);
-const TEXT: egui::Color32 = egui::Color32::from_rgb(235, 241, 250);
-const MUTED: egui::Color32 = egui::Color32::from_rgb(148, 163, 184);
-const BLUE: egui::Color32 = egui::Color32::from_rgb(59, 130, 246);
-const CYAN: egui::Color32 = egui::Color32::from_rgb(34, 211, 238);
-const GREEN: egui::Color32 = egui::Color32::from_rgb(52, 211, 153);
-const AMBER: egui::Color32 = egui::Color32::from_rgb(245, 158, 11);
-const RED: egui::Color32 = egui::Color32::from_rgb(248, 113, 113);
+
+#[derive(Debug, Clone, Copy)]
+struct Palette {
+    bg: egui::Color32,
+    panel: egui::Color32,
+    card: egui::Color32,
+    card_hover: egui::Color32,
+    input: egui::Color32,
+    border: egui::Color32,
+    text: egui::Color32,
+    muted: egui::Color32,
+    blue: egui::Color32,
+    cyan: egui::Color32,
+    green: egui::Color32,
+    amber: egui::Color32,
+    red: egui::Color32,
+    on_accent: egui::Color32,
+    on_warning: egui::Color32,
+}
+
+impl Palette {
+    fn for_theme(theme: ThemeMode) -> Self {
+        match theme {
+            ThemeMode::Light => Self {
+                bg: egui::Color32::from_rgb(244, 247, 251),
+                panel: egui::Color32::from_rgb(255, 255, 255),
+                card: egui::Color32::from_rgb(255, 255, 255),
+                card_hover: egui::Color32::from_rgb(237, 244, 255),
+                input: egui::Color32::from_rgb(248, 250, 252),
+                border: egui::Color32::from_rgb(203, 213, 225),
+                text: egui::Color32::from_rgb(15, 23, 42),
+                muted: egui::Color32::from_rgb(71, 85, 105),
+                blue: egui::Color32::from_rgb(37, 99, 235),
+                cyan: egui::Color32::from_rgb(8, 145, 178),
+                green: egui::Color32::from_rgb(4, 120, 87),
+                amber: egui::Color32::from_rgb(180, 83, 9),
+                red: egui::Color32::from_rgb(185, 28, 28),
+                on_accent: egui::Color32::WHITE,
+                on_warning: egui::Color32::WHITE,
+            },
+            ThemeMode::Dark => Self {
+                bg: egui::Color32::from_rgb(11, 18, 32),
+                panel: egui::Color32::from_rgb(17, 27, 46),
+                card: egui::Color32::from_rgb(24, 37, 58),
+                card_hover: egui::Color32::from_rgb(34, 51, 77),
+                input: egui::Color32::from_rgb(15, 25, 43),
+                border: egui::Color32::from_rgb(71, 85, 105),
+                text: egui::Color32::from_rgb(248, 250, 252),
+                muted: egui::Color32::from_rgb(203, 213, 225),
+                blue: egui::Color32::from_rgb(96, 165, 250),
+                cyan: egui::Color32::from_rgb(34, 211, 238),
+                green: egui::Color32::from_rgb(52, 211, 153),
+                amber: egui::Color32::from_rgb(251, 191, 36),
+                red: egui::Color32::from_rgb(248, 113, 113),
+                on_accent: egui::Color32::from_rgb(8, 18, 35),
+                on_warning: egui::Color32::from_rgb(40, 24, 3),
+            },
+        }
+    }
+}
 
 pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1360.0, 840.0])
-            .with_min_inner_size([1080.0, 680.0]),
+            .with_inner_size([1440.0, 900.0])
+            .with_min_inner_size([1120.0, 720.0]),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
@@ -103,10 +151,11 @@ struct DashboardApp {
     row_limit: u32,
     auto_refresh: bool,
     refresh_seconds: u64,
+    theme: ThemeMode,
     application_search: String,
     applications: Vec<TopApplicationRow>,
     selected_application: Option<String>,
-    domains: Vec<TopDomainRow>,
+    domains: Vec<TopDomainDetailRow>,
     totals: TrafficTotals,
     state: CaptureState,
     capture: Option<CaptureWorker>,
@@ -121,9 +170,9 @@ struct DashboardApp {
 impl DashboardApp {
     fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         install_chinese_font(&creation_context.egui_ctx);
-        configure_style(&creation_context.egui_ctx);
-
         let settings = AppSettings::load();
+        configure_style(&creation_context.egui_ctx, settings.theme);
+
         let now = Instant::now();
         let mut app = Self {
             devices: Vec::new(),
@@ -133,6 +182,7 @@ impl DashboardApp {
             row_limit: settings.row_limit,
             auto_refresh: settings.auto_refresh,
             refresh_seconds: settings.refresh_seconds,
+            theme: settings.theme,
             application_search: String::new(),
             applications: Vec::new(),
             selected_application: None,
@@ -152,6 +202,10 @@ impl DashboardApp {
         app
     }
 
+    fn palette(&self) -> Palette {
+        Palette::for_theme(self.theme)
+    }
+
     fn settings(&self) -> AppSettings {
         AppSettings {
             selected_device: self.selected_device.clone(),
@@ -160,11 +214,18 @@ impl DashboardApp {
             row_limit: self.row_limit,
             auto_refresh: self.auto_refresh,
             refresh_seconds: self.refresh_seconds,
+            theme: self.theme,
         }
     }
 
     fn save_settings(&self) {
         let _ = self.settings().save();
+    }
+
+    fn toggle_theme(&mut self, ctx: &egui::Context) {
+        self.theme = self.theme.toggled();
+        configure_style(ctx, self.theme);
+        self.save_settings();
     }
 
     fn refresh_devices(&mut self) {
@@ -302,7 +363,7 @@ impl DashboardApp {
                 .selected_application
                 .as_deref()
                 .filter(|selected| applications.iter().any(|row| row.application == *selected));
-            let domains = storage.top_domains(self.period, selected, self.row_limit)?;
+            let domains = storage.top_domain_details(self.period, selected, self.row_limit)?;
             let totals = storage.totals(self.period)?;
             Ok((applications, selected.map(str::to_string), domains, totals))
         });
@@ -367,10 +428,15 @@ impl DashboardApp {
         }
     }
 
-    fn render_sidebar(&mut self, ui: &mut egui::Ui) {
-        section_title(ui, "抓包控制", "选择网卡后即可持续记录，无需命令行");
-        card(ui, |ui| {
-            ui.label(egui::RichText::new("联网网卡").color(MUTED));
+    fn render_sidebar(&mut self, ui: &mut egui::Ui, palette: Palette) {
+        section_title(
+            ui,
+            "抓包控制",
+            "选择当前联网网卡后即可持续记录",
+            palette,
+        );
+        card(ui, palette, |ui| {
+            ui.label(egui::RichText::new("联网网卡").color(palette.muted));
             let selected_text = self
                 .selected_device
                 .as_ref()
@@ -381,7 +447,7 @@ impl DashboardApp {
             let enabled = self.capture.is_none();
             ui.add_enabled_ui(enabled, |ui| {
                 egui::ComboBox::from_id_salt("capture-adapter")
-                    .selected_text(selected_text)
+                    .selected_text(egui::RichText::new(selected_text).color(palette.text))
                     .width(ui.available_width())
                     .show_ui(ui, |ui| {
                         for device in &self.devices {
@@ -403,14 +469,22 @@ impl DashboardApp {
 
             ui.add_space(8.0);
             let capture_button = if self.capture.is_none() {
-                egui::Button::new(egui::RichText::new("▶ 开始记录流量").strong().color(TEXT))
-                    .fill(BLUE)
+                egui::Button::new(
+                    egui::RichText::new("▶ 开始记录流量")
+                        .strong()
+                        .color(palette.on_accent),
+                )
+                .fill(palette.blue)
             } else {
-                egui::Button::new(egui::RichText::new("■ 停止并安全保存").strong().color(TEXT))
-                    .fill(AMBER)
+                egui::Button::new(
+                    egui::RichText::new("■ 停止并安全保存")
+                        .strong()
+                        .color(palette.on_warning),
+                )
+                .fill(palette.amber)
             };
             let clicked = ui
-                .add_sized([ui.available_width(), 42.0], capture_button)
+                .add_sized([ui.available_width(), 44.0], capture_button)
                 .clicked();
             if clicked {
                 if self.capture.is_none() {
@@ -419,25 +493,30 @@ impl DashboardApp {
                     self.stop_capture();
                 }
             }
-            ui.add_space(6.0);
-            status_badge(ui, &self.state);
+            ui.add_space(7.0);
+            status_badge(ui, &self.state, palette);
             ui.label(
                 egui::RichText::new("Npcap 抓包通常需要以管理员身份运行。")
                     .small()
-                    .color(MUTED),
+                    .color(palette.muted),
             );
         });
 
         ui.add_space(14.0);
-        section_title(ui, "数据保存", "关闭和重启不会清空，继续写入同一数据库");
-        card(ui, |ui| {
-            ui.label(egui::RichText::new("SQLite 数据库").color(MUTED));
+        section_title(
+            ui,
+            "数据保存",
+            "关闭或重启不会清空，本月数据持续累加",
+            palette,
+        );
+        card(ui, palette, |ui| {
+            ui.label(egui::RichText::new("SQLite 数据库").color(palette.muted));
             ui.add_enabled(
                 self.capture.is_none(),
                 egui::TextEdit::singleline(&mut self.database_path)
                     .desired_width(ui.available_width()),
             );
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("打开数据目录").clicked() {
                     self.open_database_folder();
                 }
@@ -454,16 +533,30 @@ impl DashboardApp {
                 }
             });
             ui.label(
-                egui::RichText::new("✓ 数据按天累加；本月累计会跨重启保留。")
+                egui::RichText::new("✓ 数据按天持久化；默认显示月初至今。")
                     .small()
-                    .color(GREEN),
+                    .color(palette.green),
             );
         });
 
         ui.add_space(14.0);
-        section_title(ui, "显示设置", "筛选统计周期与刷新频率");
-        card(ui, |ui| {
-            ui.label(egui::RichText::new("统计周期").color(MUTED));
+        section_title(ui, "显示设置", "主题、统计周期与刷新频率", palette);
+        card(ui, palette, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("当前主题").color(palette.muted));
+                ui.label(
+                    egui::RichText::new(theme_label(self.theme))
+                        .strong()
+                        .color(palette.text),
+                );
+            });
+            ui.label(
+                egui::RichText::new("可在窗口右上角随时切换。")
+                    .small()
+                    .color(palette.muted),
+            );
+            ui.separator();
+            ui.label(egui::RichText::new("统计周期").color(palette.muted));
             period_selector(ui, &mut self.period);
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -489,31 +582,31 @@ impl DashboardApp {
 
         if let Some(summary) = &self.last_summary {
             ui.add_space(14.0);
-            section_title(ui, "最近一次抓包", "安全停止后的运行摘要");
-            card(ui, |ui| {
-                summary_row(ui, "捕获数据包", summary.captured_packets);
-                summary_row(ui, "纳入统计", summary.accepted_packets);
-                summary_row(ui, "应用已归因", summary.attributed_packets);
-                summary_row(ui, "应用未归因", summary.attribution_misses);
-                summary_row(ui, "解析错误", summary.parse_errors);
-                summary_row(ui, "写入批次", summary.submitted_batches);
+            section_title(ui, "最近一次抓包", "安全停止后的运行摘要", palette);
+            card(ui, palette, |ui| {
+                summary_row(ui, "捕获数据包", summary.captured_packets, palette);
+                summary_row(ui, "纳入统计", summary.accepted_packets, palette);
+                summary_row(ui, "应用已归因", summary.attributed_packets, palette);
+                summary_row(ui, "应用未归因", summary.attribution_misses, palette);
+                summary_row(ui, "解析错误", summary.parse_errors, palette);
+                summary_row(ui, "写入批次", summary.submitted_batches, palette);
             });
         }
 
         if let Some(notice) = &self.notice {
             ui.add_space(12.0);
             let color = if matches!(self.state, CaptureState::Failed(_)) {
-                RED
+                palette.red
             } else {
-                MUTED
+                palette.muted
             };
-            card(ui, |ui| {
+            card(ui, palette, |ui| {
                 ui.label(egui::RichText::new(notice).color(color));
             });
         }
     }
 
-    fn render_dashboard(&mut self, ui: &mut egui::Ui) {
+    fn render_dashboard(&mut self, ui: &mut egui::Ui, palette: Palette) {
         let app_coverage = percentage(
             self.totals
                 .bytes
@@ -528,56 +621,106 @@ impl DashboardApp {
         );
 
         ui.horizontal_wrapped(|ui| {
-            metric_card(ui, "本期流量", &format_bytes(self.totals.bytes), BLUE);
-            metric_card(ui, "数据包", &format_integer(self.totals.packets), CYAN);
-            metric_card(ui, "应用归因率", &format!("{app_coverage:.1}%"), GREEN);
-            metric_card(ui, "域名识别率", &format!("{domain_coverage:.1}%"), AMBER);
-            metric_card(ui, "实时写入", &format_rate(self.bytes_per_second), CYAN);
+            metric_card(
+                ui,
+                "本期总流量",
+                &format_bytes(self.totals.bytes),
+                palette.blue,
+                palette,
+            );
+            metric_card(
+                ui,
+                "可细分上行",
+                &format_bytes(self.totals.breakdown.upload_bytes),
+                palette.green,
+                palette,
+            );
+            metric_card(
+                ui,
+                "可细分下行",
+                &format_bytes(self.totals.breakdown.download_bytes),
+                palette.cyan,
+                palette,
+            );
+            metric_card(
+                ui,
+                "应用归因率",
+                &format!("{app_coverage:.1}%"),
+                palette.green,
+                palette,
+            );
+            metric_card(
+                ui,
+                "域名识别率",
+                &format!("{domain_coverage:.1}%"),
+                palette.amber,
+                palette,
+            );
+            metric_card(
+                ui,
+                "实时写入",
+                &format_rate(self.bytes_per_second),
+                palette.cyan,
+                palette,
+            );
         });
 
         ui.add_space(14.0);
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new(period_title(self.period)).color(TEXT));
-                ui.label(
-                    egui::RichText::new("数据来自持久化 SQLite，关闭程序后仍会保留")
-                        .small()
-                        .color(MUTED),
-                );
+        card(ui, palette, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.vertical(|ui| {
+                    ui.heading(
+                        egui::RichText::new(period_title(self.period))
+                            .strong()
+                            .color(palette.text),
+                    );
+                    ui.label(
+                        egui::RichText::new("持久化 SQLite · 关闭程序后数据仍保留")
+                            .small()
+                            .color(palette.muted),
+                    );
+                });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_sized(
-                        [240.0, 30.0],
+                        [260.0, 32.0],
                         egui::TextEdit::singleline(&mut self.application_search)
-                            .hint_text("搜索应用，例如 chrome、微信"),
+                            .hint_text("搜索应用，例如 edge、微信"),
                     );
                 });
             });
         });
 
         ui.add_space(12.0);
+        render_visibility_boundary(ui, self.totals, palette);
+        ui.add_space(12.0);
+
         let available = ui.available_size();
         ui.columns(2, |columns| {
-            columns[0].set_min_width((available.x * 0.42).max(360.0));
-            self.render_applications(&mut columns[0]);
-            self.render_domains(&mut columns[1]);
+            columns[0].set_min_width((available.x * 0.38).max(360.0));
+            self.render_applications(&mut columns[0], palette);
+            self.render_domains(&mut columns[1], palette);
         });
     }
 
-    fn render_applications(&mut self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
+    fn render_applications(&mut self, ui: &mut egui::Ui, palette: Palette) {
+        card(ui, palette, |ui| {
             ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new("应用流量排行").color(TEXT));
+                ui.heading(
+                    egui::RichText::new("应用流量排行")
+                        .strong()
+                        .color(palette.text),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(format!("{} 个应用", self.applications.len()))
-                            .color(MUTED),
+                            .color(palette.muted),
                     );
                 });
             });
             ui.label(
-                egui::RichText::new("先选择应用，再查看该应用访问的域名。")
+                egui::RichText::new("选择应用后，右侧显示该应用的域名与方向细分。")
                     .small()
-                    .color(MUTED),
+                    .color(palette.muted),
             );
             ui.add_space(8.0);
 
@@ -589,7 +732,8 @@ impl DashboardApp {
                 self.totals.packets,
                 1.0,
                 all_selected,
-                BLUE,
+                palette.blue,
+                palette,
             ) {
                 self.select_application(None);
             }
@@ -616,11 +760,11 @@ impl DashboardApp {
                         let selected =
                             self.selected_application.as_deref() == Some(row.application.as_str());
                         let color = if row.application == UNKNOWN_APPLICATION {
-                            AMBER
+                            palette.amber
                         } else if row.application == HISTORICAL_APPLICATION {
-                            MUTED
+                            palette.muted
                         } else {
-                            BLUE
+                            palette.blue
                         };
                         if application_row(
                             ui,
@@ -630,6 +774,7 @@ impl DashboardApp {
                             row.bytes as f32 / max_bytes as f32,
                             selected,
                             color,
+                            palette,
                         ) {
                             pending = Some(row.application);
                         }
@@ -641,25 +786,29 @@ impl DashboardApp {
         });
     }
 
-    fn render_domains(&self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
+    fn render_domains(&self, ui: &mut egui::Ui, palette: Palette) {
+        card(ui, palette, |ui| {
             let app_title = self
                 .selected_application
                 .as_deref()
                 .map(display_application)
                 .unwrap_or_else(|| "全部应用".to_string());
-            ui.heading(egui::RichText::new(format!("{app_title} · 访问域名")).color(TEXT));
+            ui.heading(
+                egui::RichText::new(format!("{app_title} · 域名流量明细"))
+                    .strong()
+                    .color(palette.text),
+            );
             ui.label(
                 egui::RichText::new(
-                    "HTTPS 域名来自 TLS ClientHello；QUIC、ECH 或漏抓握手会显示为未知域名。",
+                    "显示流量方向与传输协议；HTTPS 正文仍由 TLS 加密，本工具不会解密内容。",
                 )
                 .small()
-                .color(MUTED),
+                .color(palette.muted),
             );
-            ui.add_space(8.0);
+            ui.add_space(10.0);
 
             if self.domains.is_empty() {
-                empty_state(ui);
+                empty_state(ui, palette);
                 return;
             }
 
@@ -668,35 +817,10 @@ impl DashboardApp {
                 .id_salt("domains-scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    egui::Grid::new("domain-table")
-                        .striped(true)
-                        .min_col_width(80.0)
-                        .show(ui, |ui| {
-                            ui.strong("域名");
-                            ui.strong("流量");
-                            ui.strong("数据包");
-                            ui.end_row();
-
-                            for row in &self.domains {
-                                let label = display_domain(&row.domain);
-                                ui.label(shorten_text(&label, 42)).on_hover_text(&label);
-                                ui.horizontal(|ui| {
-                                    let ratio = row.bytes as f32 / max_bytes as f32;
-                                    ui.add(
-                                        egui::ProgressBar::new(ratio.clamp(0.0, 1.0))
-                                            .desired_width(130.0)
-                                            .fill(if row.domain == UNKNOWN_DOMAIN {
-                                                AMBER
-                                            } else {
-                                                BLUE
-                                            })
-                                            .text(format_bytes(row.bytes)),
-                                    );
-                                });
-                                ui.label(format_integer(row.packets));
-                                ui.end_row();
-                            }
-                        });
+                    for row in &self.domains {
+                        domain_detail_card(ui, row, max_bytes, palette);
+                        ui.add_space(8.0);
+                    }
                 });
         });
     }
@@ -720,66 +844,94 @@ impl eframe::App for DashboardApp {
             self.refresh_data(true);
         }
 
+        let palette = self.palette();
+        let mut toggle_theme = false;
         egui::TopBottomPanel::top("header")
-            .exact_height(72.0)
+            .exact_height(78.0)
             .frame(
                 egui::Frame::default()
-                    .fill(PANEL)
-                    .inner_margin(egui::Margin::symmetric(22, 12))
-                    .stroke(egui::Stroke::new(1.0, BORDER)),
+                    .fill(palette.panel)
+                    .inner_margin(egui::Margin::symmetric(22, 13))
+                    .stroke(egui::Stroke::new(1.0, palette.border)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.heading(
                             egui::RichText::new("域流量管家")
-                                .size(24.0)
+                                .size(25.0)
                                 .strong()
-                                .color(TEXT),
+                                .color(palette.text),
                         );
-                        ui.label(egui::RichText::new("Windows 应用与域名流量仪表盘").color(MUTED));
+                        ui.label(
+                            egui::RichText::new("Windows 应用、域名与流量方向仪表盘")
+                                .color(palette.muted),
+                        );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        status_badge(ui, &self.state);
+                        status_badge(ui, &self.state, palette);
+                        let label = match self.theme {
+                            ThemeMode::Light => "🌙 深色模式",
+                            ThemeMode::Dark => "☀ 明亮模式",
+                        };
+                        if ui.button(label).clicked() {
+                            toggle_theme = true;
+                        }
                     });
                 });
             });
+        if toggle_theme {
+            self.toggle_theme(ctx);
+        }
 
+        let palette = self.palette();
         egui::SidePanel::left("controls")
             .resizable(false)
-            .exact_width(340.0)
+            .exact_width(350.0)
             .frame(
                 egui::Frame::default()
-                    .fill(BG)
+                    .fill(palette.bg)
                     .inner_margin(egui::Margin::same(16)),
             )
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.render_sidebar(ui));
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.render_sidebar(ui, palette);
+                });
             });
 
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
-                    .fill(BG)
+                    .fill(palette.bg)
                     .inner_margin(egui::Margin::same(18)),
             )
-            .show(ctx, |ui| self.render_dashboard(ui));
+            .show(ctx, |ui| self.render_dashboard(ui, palette));
 
         ctx.request_repaint_after(UI_TICK);
     }
 }
 
-fn configure_style(ctx: &egui::Context) {
+fn configure_style(ctx: &egui::Context, theme: ThemeMode) {
+    let palette = Palette::for_theme(theme);
     let mut style = (*ctx.style()).clone();
-    style.visuals = egui::Visuals::dark();
-    style.visuals.panel_fill = BG;
-    style.visuals.window_fill = PANEL;
-    style.visuals.extreme_bg_color = egui::Color32::from_rgb(10, 16, 30);
-    style.visuals.widgets.inactive.bg_fill = CARD;
-    style.visuals.widgets.hovered.bg_fill = CARD_HOVER;
-    style.visuals.widgets.active.bg_fill = BLUE;
-    style.visuals.widgets.inactive.fg_stroke.color = TEXT;
-    style.visuals.widgets.hovered.fg_stroke.color = TEXT;
+    style.visuals = match theme {
+        ThemeMode::Light => egui::Visuals::light(),
+        ThemeMode::Dark => egui::Visuals::dark(),
+    };
+    style.visuals.panel_fill = palette.bg;
+    style.visuals.window_fill = palette.panel;
+    style.visuals.extreme_bg_color = palette.input;
+    style.visuals.faint_bg_color = palette.card_hover;
+    style.visuals.widgets.inactive.bg_fill = palette.input;
+    style.visuals.widgets.hovered.bg_fill = palette.card_hover;
+    style.visuals.widgets.active.bg_fill = palette.blue;
+    style.visuals.widgets.inactive.fg_stroke.color = palette.text;
+    style.visuals.widgets.hovered.fg_stroke.color = palette.text;
+    style.visuals.widgets.active.fg_stroke.color = palette.on_accent;
+    style.visuals.override_text_color = Some(palette.text);
+    style.visuals.selection.bg_fill = palette.blue;
+    style.visuals.selection.stroke.color = palette.on_accent;
+    style.visuals.window_stroke = egui::Stroke::new(1.0, palette.border);
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
     style.spacing.button_padding = egui::vec2(12.0, 7.0);
     ctx.set_style(style);
@@ -820,31 +972,54 @@ fn install_chinese_font(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-fn card<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
+fn card<R>(
+    ui: &mut egui::Ui,
+    palette: Palette,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
     egui::Frame::default()
-        .fill(CARD)
-        .stroke(egui::Stroke::new(1.0, BORDER))
-        .corner_radius(10)
-        .inner_margin(egui::Margin::same(14))
+        .fill(palette.card)
+        .stroke(egui::Stroke::new(1.0, palette.border))
+        .corner_radius(11)
+        .inner_margin(egui::Margin::same(15))
         .show(ui, content)
         .inner
 }
 
-fn section_title(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    ui.heading(egui::RichText::new(title).size(18.0).strong().color(TEXT));
-    ui.label(egui::RichText::new(subtitle).small().color(MUTED));
+fn section_title(ui: &mut egui::Ui, title: &str, subtitle: &str, palette: Palette) {
+    ui.heading(
+        egui::RichText::new(title)
+            .size(18.0)
+            .strong()
+            .color(palette.text),
+    );
+    ui.label(
+        egui::RichText::new(subtitle)
+            .small()
+            .color(palette.muted),
+    );
     ui.add_space(6.0);
 }
 
-fn metric_card(ui: &mut egui::Ui, title: &str, value: &str, accent: egui::Color32) {
+fn metric_card(
+    ui: &mut egui::Ui,
+    title: &str,
+    value: &str,
+    accent: egui::Color32,
+    palette: Palette,
+) {
     egui::Frame::default()
-        .fill(CARD)
-        .stroke(egui::Stroke::new(1.0, BORDER))
-        .corner_radius(10)
-        .inner_margin(egui::Margin::symmetric(14, 11))
+        .fill(palette.card)
+        .stroke(egui::Stroke::new(1.0, palette.border))
+        .corner_radius(11)
+        .inner_margin(egui::Margin::symmetric(15, 12))
         .show(ui, |ui| {
-            ui.set_min_width(155.0);
-            ui.label(egui::RichText::new(title).small().color(MUTED));
+            ui.set_min_width(156.0);
+            ui.label(
+                egui::RichText::new(title)
+                    .small()
+                    .color(palette.muted),
+            );
             ui.label(egui::RichText::new(value).size(22.0).strong().color(accent));
         });
 }
@@ -857,6 +1032,7 @@ fn period_selector(ui: &mut egui::Ui, period: &mut TrafficPeriod) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn application_row(
     ui: &mut egui::Ui,
     name: &str,
@@ -865,28 +1041,33 @@ fn application_row(
     ratio: f32,
     selected: bool,
     color: egui::Color32,
+    palette: Palette,
 ) -> bool {
-    let fill = if selected { CARD_HOVER } else { CARD };
+    let fill = if selected {
+        palette.card_hover
+    } else {
+        palette.card
+    };
     let response = egui::Frame::default()
         .fill(fill)
         .stroke(egui::Stroke::new(
-            if selected { 1.5 } else { 0.5 },
-            if selected { color } else { BORDER },
+            if selected { 1.5 } else { 0.7 },
+            if selected { color } else { palette.border },
         ))
-        .corner_radius(8)
-        .inner_margin(egui::Margin::symmetric(10, 8))
+        .corner_radius(9)
+        .inner_margin(egui::Margin::symmetric(11, 9))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(
                         egui::RichText::new(shorten_text(name, 34))
                             .strong()
-                            .color(TEXT),
+                            .color(palette.text),
                     );
                     ui.label(
                         egui::RichText::new(format!("{} 个数据包", format_integer(packets)))
                             .small()
-                            .color(MUTED),
+                            .color(palette.muted),
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -907,31 +1088,194 @@ fn application_row(
     response.interact(egui::Sense::click()).clicked()
 }
 
-fn empty_state(ui: &mut egui::Ui) {
+fn domain_detail_card(
+    ui: &mut egui::Ui,
+    row: &TopDomainDetailRow,
+    max_bytes: u64,
+    palette: Palette,
+) {
+    let accent = if row.domain == UNKNOWN_DOMAIN {
+        palette.amber
+    } else {
+        palette.blue
+    };
+    egui::Frame::default()
+        .fill(palette.input)
+        .stroke(egui::Stroke::new(1.0, palette.border))
+        .corner_radius(9)
+        .inner_margin(egui::Margin::symmetric(13, 11))
+        .show(ui, |ui| {
+            let label = display_domain(&row.domain);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(shorten_text(&label, 48))
+                        .strong()
+                        .color(palette.text),
+                )
+                .on_hover_text(&label);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format_bytes(row.bytes))
+                            .strong()
+                            .color(accent),
+                    );
+                });
+            });
+            let ratio = row.bytes as f32 / max_bytes.max(1) as f32;
+            ui.add(
+                egui::ProgressBar::new(ratio.clamp(0.0, 1.0))
+                    .desired_width(ui.available_width())
+                    .fill(accent),
+            );
+
+            if row.breakdown.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} 个数据包 · 旧版记录无方向与协议细分",
+                        format_integer(row.packets)
+                    ))
+                    .small()
+                    .color(palette.muted),
+                );
+                return;
+            }
+
+            let detailed_bytes = row.breakdown.bytes();
+            let tcp_share = percentage(row.breakdown.tcp_bytes, detailed_bytes);
+            let udp_share = percentage(row.breakdown.udp_bytes, detailed_bytes);
+            ui.horizontal_wrapped(|ui| {
+                detail_chip(
+                    ui,
+                    &format!("↑ 上行 {}", format_bytes(row.breakdown.upload_bytes)),
+                    palette.green,
+                    palette,
+                );
+                detail_chip(
+                    ui,
+                    &format!("↓ 下行 {}", format_bytes(row.breakdown.download_bytes)),
+                    palette.cyan,
+                    palette,
+                );
+                detail_chip(
+                    ui,
+                    &format!("TLS/TCP {tcp_share:.1}%"),
+                    palette.blue,
+                    palette,
+                );
+                detail_chip(
+                    ui,
+                    &format!("QUIC/UDP {udp_share:.1}%"),
+                    palette.amber,
+                    palette,
+                );
+            });
+            ui.label(
+                egui::RichText::new(format!(
+                    "上行包 {} · 下行包 {} · 总包 {}",
+                    format_integer(row.breakdown.upload_packets),
+                    format_integer(row.breakdown.download_packets),
+                    format_integer(row.packets),
+                ))
+                .small()
+                .color(palette.muted),
+            );
+            let legacy_bytes = row.bytes.saturating_sub(detailed_bytes);
+            if legacy_bytes > 0 {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "其中 {} 为升级前记录，仅保留总量。",
+                        format_bytes(legacy_bytes)
+                    ))
+                    .small()
+                    .color(palette.muted),
+                );
+            }
+        });
+}
+
+fn detail_chip(
+    ui: &mut egui::Ui,
+    text: &str,
+    color: egui::Color32,
+    palette: Palette,
+) {
+    egui::Frame::default()
+        .fill(color.gamma_multiply(match palette.text == egui::Color32::from_rgb(15, 23, 42) {
+            true => 0.10,
+            false => 0.18,
+        }))
+        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.75)))
+        .corner_radius(12)
+        .inner_margin(egui::Margin::symmetric(9, 4))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).small().strong().color(color));
+        });
+}
+
+fn render_visibility_boundary(ui: &mut egui::Ui, totals: TrafficTotals, palette: Palette) {
+    card(ui, palette, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new("可见颗粒度")
+                        .strong()
+                        .color(palette.text),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "应用 → 域名 → 上行/下行 → TLS(TCP)/QUIC(UDP) → 字节与数据包",
+                    )
+                    .color(palette.blue),
+                );
+            });
+        });
+        ui.separator();
+        ui.label(
+            egui::RichText::new(
+                "HTTPS 正文、URL 路径、消息、文件内容与账号信息由 TLS 加密，本工具不会安装证书、注入进程或解密通信。",
+            )
+            .color(palette.text),
+        );
+        let detailed = totals.breakdown.bytes();
+        if totals.bytes > detailed {
+            ui.label(
+                egui::RichText::new(format!(
+                    "当前有 {} 的历史流量仅保留总量；方向与协议细分从 v0.4 起记录。",
+                    format_bytes(totals.bytes.saturating_sub(detailed))
+                ))
+                .small()
+                .color(palette.muted),
+            );
+        }
+    });
+}
+
+fn empty_state(ui: &mut egui::Ui, palette: Palette) {
     ui.add_space(30.0);
     ui.vertical_centered(|ui| {
         ui.label(
             egui::RichText::new("暂无流量数据")
                 .size(20.0)
                 .strong()
-                .color(TEXT),
+                .color(palette.text),
         );
         ui.label(
-            egui::RichText::new("开始抓包并访问网页后，应用与域名会自动出现在这里。").color(MUTED),
+            egui::RichText::new("开始抓包并访问网页后，应用与域名会自动出现在这里。")
+                .color(palette.muted),
         );
     });
 }
 
-fn status_badge(ui: &mut egui::Ui, state: &CaptureState) {
+fn status_badge(ui: &mut egui::Ui, state: &CaptureState, palette: Palette) {
     let (text, color) = match state {
-        CaptureState::Idle => ("未开始", MUTED),
-        CaptureState::Running => ("● 正在抓包", GREEN),
-        CaptureState::Stopping => ("● 正在安全保存", AMBER),
-        CaptureState::Finished => ("已停止并保存", CYAN),
-        CaptureState::Failed(_) => ("发生错误", RED),
+        CaptureState::Idle => ("未开始", palette.muted),
+        CaptureState::Running => ("● 正在抓包", palette.green),
+        CaptureState::Stopping => ("● 正在安全保存", palette.amber),
+        CaptureState::Finished => ("已停止并保存", palette.cyan),
+        CaptureState::Failed(_) => ("发生错误", palette.red),
     };
     let response = egui::Frame::default()
-        .fill(color.gamma_multiply(0.16))
+        .fill(color.gamma_multiply(0.14))
         .stroke(egui::Stroke::new(1.0, color))
         .corner_radius(16)
         .inner_margin(egui::Margin::symmetric(12, 5))
@@ -944,11 +1288,15 @@ fn status_badge(ui: &mut egui::Ui, state: &CaptureState) {
     }
 }
 
-fn summary_row(ui: &mut egui::Ui, label: &str, value: u64) {
+fn summary_row(ui: &mut egui::Ui, label: &str, value: u64, palette: Palette) {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).color(MUTED));
+        ui.label(egui::RichText::new(label).color(palette.muted));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.monospace(format_integer(value));
+            ui.label(
+                egui::RichText::new(format_integer(value))
+                    .monospace()
+                    .color(palette.text),
+            );
         });
     });
 }
@@ -1009,6 +1357,13 @@ fn display_domain(domain: &str) -> String {
         "未知域名".to_string()
     } else {
         domain.to_string()
+    }
+}
+
+fn theme_label(theme: ThemeMode) -> &'static str {
+    match theme {
+        ThemeMode::Light => "明亮模式",
+        ThemeMode::Dark => "深色模式",
     }
 }
 
@@ -1113,15 +1468,34 @@ mod tests {
     }
 
     #[test]
+    fn theme_labels_and_palettes_are_distinct() {
+        assert_eq!(theme_label(ThemeMode::Light), "明亮模式");
+        assert_eq!(theme_label(ThemeMode::Dark), "深色模式");
+        let light = Palette::for_theme(ThemeMode::Light);
+        let dark = Palette::for_theme(ThemeMode::Dark);
+        assert_ne!(light.bg, dark.bg);
+        assert_ne!(light.text, dark.text);
+    }
+
+    #[test]
     fn byte_and_integer_formatters_are_stable() {
         assert_eq!(format_bytes(1024), "1.0 KiB");
         assert_eq!(format_integer(1_234_567), "1,234,567");
     }
 
     #[test]
+    fn detail_percentage_is_stable() {
+        let detail = TrafficBreakdown {
+            tcp_bytes: 75,
+            udp_bytes: 25,
+            ..TrafficBreakdown::default()
+        };
+        assert_eq!(percentage(detail.tcp_bytes, detail.tcp_bytes + detail.udp_bytes), 75.0);
+    }
+
+    #[test]
     fn long_text_is_shortened() {
-        let shortened = shorten_text("very-long-subdomain.example.com", 16);
-        assert_eq!(shortened.chars().count(), 16);
-        assert!(shortened.ends_with('…'));
+        assert_eq!(shorten_text("abcdefghijkl", 6), "abcde…");
+        assert_eq!(shorten_text("abc", 6), "abc");
     }
 }
