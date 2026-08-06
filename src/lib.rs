@@ -1,4 +1,5 @@
 pub mod aggregate;
+pub mod app_storage;
 pub mod attribution;
 pub mod capture;
 pub mod cli;
@@ -7,5 +8,6 @@ pub mod gui;
 pub mod model;
 pub mod packet;
 pub mod runtime;
+pub mod settings;
 pub mod storage;
 pub mod tls;
