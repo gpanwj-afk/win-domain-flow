@@ -1,10 +1,10 @@
 [package]
 name = "win-domain-flow"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
-description = "Windows application, domain, direction, and transport traffic monitor"
+description = "Windows application and domain traffic monitor with optional browser activity diagnostics"
 repository = "https://github.com/gpanwj-afk/win-domain-flow"
 publish = false
 default-run = "win-domain-flow-gui"
@@ -29,6 +29,8 @@ eframe = { version = "=0.31.1", default-features = false, features = ["default_f
 etherparse = "=0.21.0"
 pcap = "=2.4.0"
 rusqlite = { version = "=0.32.1", features = ["bundled"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
 thiserror = "=2.0.18"
 
 [target.'cfg(windows)'.dependencies]

@@ -3,6 +3,8 @@ pub mod app_runtime;
 pub mod app_storage;
 pub mod app_tracker;
 pub mod attribution;
+pub mod browser_activity;
+pub mod browser_ui;
 pub mod capture;
 pub mod cli;
 pub mod flow;

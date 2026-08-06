@@ -1,5 +1,6 @@
 use crate::app_runtime::{run_live_with_shutdown, ApplicationRunSummary};
 use crate::app_storage::{ApplicationStorage, TrafficPeriod};
+use crate::browser_ui::BrowserDiagnosticsPane;
 use crate::capture::{list_devices, CaptureDeviceInfo};
 use crate::model::{
     TopApplicationRow, TopDomainDetailRow, TrafficTotals, HISTORICAL_APPLICATION,
@@ -82,7 +83,7 @@ pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
-            .with_min_inner_size([1120.0, 720.0]),
+            .with_min_inner_size([900.0, 680.0]),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
@@ -165,6 +166,7 @@ struct DashboardApp {
     last_total_bytes: u64,
     bytes_per_second: f64,
     notice: Option<String>,
+    browser_diagnostics: BrowserDiagnosticsPane,
 }
 
 impl DashboardApp {
@@ -173,6 +175,7 @@ impl DashboardApp {
         let settings = AppSettings::load();
         configure_style(&creation_context.egui_ctx, settings.theme);
 
+        let browser_database_path = settings.database_path.clone();
         let now = Instant::now();
         let mut app = Self {
             devices: Vec::new(),
@@ -196,6 +199,7 @@ impl DashboardApp {
             last_total_bytes: 0,
             bytes_per_second: 0.0,
             notice: None,
+            browser_diagnostics: BrowserDiagnosticsPane::new(browser_database_path),
         };
         app.refresh_devices();
         app.refresh_data(false);
@@ -602,6 +606,9 @@ impl DashboardApp {
     }
 
     fn render_dashboard(&mut self, ui: &mut egui::Ui, palette: Palette) {
+        self.browser_diagnostics
+            .set_database_path(PathBuf::from(self.database_path.trim()));
+
         let app_coverage = percentage(
             self.totals
                 .bytes
@@ -615,50 +622,37 @@ impl DashboardApp {
             self.totals.bytes,
         );
 
-        ui.horizontal_wrapped(|ui| {
-            metric_card(
-                ui,
-                "本期总流量",
-                &format_bytes(self.totals.bytes),
-                palette.blue,
-                palette,
-            );
-            metric_card(
-                ui,
-                "可细分上行",
-                &format_bytes(self.totals.breakdown.upload_bytes),
-                palette.green,
-                palette,
-            );
-            metric_card(
-                ui,
-                "可细分下行",
-                &format_bytes(self.totals.breakdown.download_bytes),
-                palette.cyan,
-                palette,
-            );
-            metric_card(
-                ui,
-                "应用归因率",
-                &format!("{app_coverage:.1}%"),
-                palette.green,
-                palette,
-            );
-            metric_card(
-                ui,
+        let available_width = ui.available_width();
+        let metric_columns = responsive_metric_columns(available_width);
+        let gap = 10.0;
+        let metric_width = ((available_width - gap * (metric_columns as f32 - 1.0))
+            / metric_columns as f32)
+            .max(145.0);
+        let metrics = [
+            ("本期总流量", format_bytes(self.totals.bytes), palette.blue),
+            ("数据包", format_integer(self.totals.packets), palette.cyan),
+            ("应用归因率", format!("{app_coverage:.1}%"), palette.green),
+            (
                 "域名识别率",
-                &format!("{domain_coverage:.1}%"),
+                format!("{domain_coverage:.1}%"),
                 palette.amber,
-                palette,
-            );
-            metric_card(
-                ui,
-                "实时写入",
-                &format_rate(self.bytes_per_second),
-                palette.cyan,
-                palette,
-            );
-        });
+            ),
+            ("实时写入", format_rate(self.bytes_per_second), palette.cyan),
+        ];
+        egui::Grid::new("responsive-metrics")
+            .num_columns(metric_columns)
+            .spacing([gap, gap])
+            .show(ui, |ui| {
+                for (index, (title, value, color)) in metrics.iter().enumerate() {
+                    metric_card(ui, title, value, *color, palette, metric_width);
+                    if (index + 1) % metric_columns == 0 {
+                        ui.end_row();
+                    }
+                }
+                if metrics.len() % metric_columns != 0 {
+                    ui.end_row();
+                }
+            });
 
         ui.add_space(14.0);
         card(ui, palette, |ui| {
@@ -676,8 +670,9 @@ impl DashboardApp {
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let search_width = ui.available_width().clamp(180.0, 340.0);
                     ui.add_sized(
-                        [260.0, 32.0],
+                        [search_width, 32.0],
                         egui::TextEdit::singleline(&mut self.application_search)
                             .hint_text("搜索应用，例如 edge、微信"),
                     );
@@ -686,15 +681,24 @@ impl DashboardApp {
         });
 
         ui.add_space(12.0);
-        render_visibility_boundary(ui, self.totals, palette);
+        render_visibility_boundary(ui, palette);
         ui.add_space(12.0);
 
-        let available = ui.available_size();
-        ui.columns(2, |columns| {
-            columns[0].set_min_width((available.x * 0.38).max(360.0));
-            self.render_applications(&mut columns[0], palette);
-            self.render_domains(&mut columns[1], palette);
-        });
+        let content_width = ui.available_width();
+        if content_width >= 940.0 {
+            ui.columns(2, |columns| {
+                columns[0].set_min_width((content_width * 0.38).max(340.0));
+                self.render_applications(&mut columns[0], palette);
+                self.render_domains(&mut columns[1], palette);
+            });
+        } else {
+            self.render_applications(ui, palette);
+            ui.add_space(12.0);
+            self.render_domains(ui, palette);
+        }
+
+        ui.add_space(14.0);
+        self.browser_diagnostics.render(ui, self.theme, self.period);
     }
 
     fn render_applications(&mut self, ui: &mut egui::Ui, palette: Palette) {
@@ -713,7 +717,7 @@ impl DashboardApp {
                 });
             });
             ui.label(
-                egui::RichText::new("选择应用后，右侧显示该应用的域名与方向细分。")
+                egui::RichText::new("选择应用后，右侧显示该应用访问的域名；具体网页用途请继续查看下方浏览器活动诊断。")
                     .small()
                     .color(palette.muted),
             );
@@ -789,17 +793,17 @@ impl DashboardApp {
                 .map(display_application)
                 .unwrap_or_else(|| "全部应用".to_string());
             ui.heading(
-                egui::RichText::new(format!("{app_title} · 域名流量明细"))
+                egui::RichText::new(format!("{app_title} · 访问域名"))
                     .strong()
                     .color(palette.text),
             );
             ui.label(
-                egui::RichText::new(
-                    "显示流量方向与传输协议；HTTPS 正文仍由 TLS 加密，本工具不会解密内容。",
-                )
-                .small()
-                .color(palette.muted),
-            );
+            egui::RichText::new(
+                "这里保留域名总量与数据包排行。要判断大流量具体用于下载、视频、接口或脚本，请在下方输入该域名。",
+            )
+            .small()
+            .color(palette.muted),
+        );
             ui.add_space(10.0);
 
             if self.domains.is_empty() {
@@ -810,10 +814,11 @@ impl DashboardApp {
             let max_bytes = self.domains.first().map_or(1, |row| row.bytes.max(1));
             egui::ScrollArea::vertical()
                 .id_salt("domains-scroll")
+                .max_height(520.0)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for row in &self.domains {
-                        domain_detail_card(ui, row, max_bytes, palette);
+                        domain_total_card(ui, row, max_bytes, palette);
                         ui.add_space(8.0);
                     }
                 });
@@ -859,7 +864,7 @@ impl eframe::App for DashboardApp {
                                 .color(palette.text),
                         );
                         ui.label(
-                            egui::RichText::new("Windows 应用、域名与流量方向仪表盘")
+                            egui::RichText::new("Windows 应用、域名与浏览器活动诊断仪表盘")
                                 .color(palette.muted),
                         );
                     });
@@ -881,8 +886,10 @@ impl eframe::App for DashboardApp {
 
         let palette = self.palette();
         egui::SidePanel::left("controls")
-            .resizable(false)
-            .exact_width(350.0)
+            .resizable(true)
+            .default_width(330.0)
+            .min_width(280.0)
+            .max_width(420.0)
             .frame(
                 egui::Frame::default()
                     .fill(palette.bg)
@@ -900,7 +907,12 @@ impl eframe::App for DashboardApp {
                     .fill(palette.bg)
                     .inner_margin(egui::Margin::same(18)),
             )
-            .show(ctx, |ui| self.render_dashboard(ui, palette));
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("main-dashboard-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.render_dashboard(ui, palette));
+            });
 
         ctx.request_repaint_after(UI_TICK);
     }
@@ -994,6 +1006,7 @@ fn metric_card(
     value: &str,
     accent: egui::Color32,
     palette: Palette,
+    width: f32,
 ) {
     egui::Frame::default()
         .fill(palette.card)
@@ -1001,10 +1014,21 @@ fn metric_card(
         .corner_radius(11)
         .inner_margin(egui::Margin::symmetric(15, 12))
         .show(ui, |ui| {
-            ui.set_min_width(156.0);
+            ui.set_min_width(width);
+            ui.set_max_width(width);
             ui.label(egui::RichText::new(title).small().color(palette.muted));
             ui.label(egui::RichText::new(value).size(22.0).strong().color(accent));
         });
+}
+
+fn responsive_metric_columns(width: f32) -> usize {
+    if width >= 1180.0 {
+        5
+    } else if width >= 760.0 {
+        3
+    } else {
+        2
+    }
 }
 
 fn period_selector(ui: &mut egui::Ui, period: &mut TrafficPeriod) {
@@ -1071,7 +1095,7 @@ fn application_row(
     response.interact(egui::Sense::click()).clicked()
 }
 
-fn domain_detail_card(
+fn domain_total_card(
     ui: &mut egui::Ui,
     row: &TopDomainDetailRow,
     max_bytes: u64,
@@ -1110,123 +1134,34 @@ fn domain_detail_card(
                     .desired_width(ui.available_width())
                     .fill(accent),
             );
-
-            if row.breakdown.is_empty() {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} 个数据包 · 旧版记录无方向与协议细分",
-                        format_integer(row.packets)
-                    ))
-                    .small()
-                    .color(palette.muted),
-                );
-                return;
-            }
-
-            let detailed_bytes = row.breakdown.bytes();
-            let tcp_share = percentage(row.breakdown.tcp_bytes, detailed_bytes);
-            let udp_share = percentage(row.breakdown.udp_bytes, detailed_bytes);
-            ui.horizontal_wrapped(|ui| {
-                detail_chip(
-                    ui,
-                    &format!("↑ 上行 {}", format_bytes(row.breakdown.upload_bytes)),
-                    palette.green,
-                    palette,
-                );
-                detail_chip(
-                    ui,
-                    &format!("↓ 下行 {}", format_bytes(row.breakdown.download_bytes)),
-                    palette.cyan,
-                    palette,
-                );
-                detail_chip(
-                    ui,
-                    &format!("TLS/TCP {tcp_share:.1}%"),
-                    palette.blue,
-                    palette,
-                );
-                detail_chip(
-                    ui,
-                    &format!("QUIC/UDP {udp_share:.1}%"),
-                    palette.amber,
-                    palette,
-                );
-            });
             ui.label(
-                egui::RichText::new(format!(
-                    "上行包 {} · 下行包 {} · 总包 {}",
-                    format_integer(row.breakdown.upload_packets),
-                    format_integer(row.breakdown.download_packets),
-                    format_integer(row.packets),
-                ))
-                .small()
-                .color(palette.muted),
-            );
-            let legacy_bytes = row.bytes.saturating_sub(detailed_bytes);
-            if legacy_bytes > 0 {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "其中 {} 为升级前记录，仅保留总量。",
-                        format_bytes(legacy_bytes)
-                    ))
+                egui::RichText::new(format!("{} 个数据包", format_integer(row.packets)))
                     .small()
                     .color(palette.muted),
-                );
-            }
+            );
         });
 }
 
-fn detail_chip(ui: &mut egui::Ui, text: &str, color: egui::Color32, palette: Palette) {
-    egui::Frame::default()
-        .fill(
-            color.gamma_multiply(match palette.text == egui::Color32::from_rgb(15, 23, 42) {
-                true => 0.10,
-                false => 0.18,
-            }),
-        )
-        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.75)))
-        .corner_radius(12)
-        .inner_margin(egui::Margin::symmetric(9, 4))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(text).small().strong().color(color));
-        });
-}
-
-fn render_visibility_boundary(ui: &mut egui::Ui, totals: TrafficTotals, palette: Palette) {
+fn render_visibility_boundary(ui: &mut egui::Ui, palette: Palette) {
     card(ui, palette, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new("可见颗粒度")
-                        .strong()
-                        .color(palette.text),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "应用 → 域名 → 上行/下行 → TLS(TCP)/QUIC(UDP) → 字节与数据包",
-                    )
-                    .color(palette.blue),
-                );
-            });
-        });
+        ui.label(
+            egui::RichText::new("从“流量多少”继续追到“网页在做什么”")
+                .strong()
+                .color(palette.text),
+        );
+        ui.label(
+            egui::RichText::new(
+                "域名总量本身无法说明业务用途。v0.5 通过可选浏览器扩展补充每个请求的实际传输字节、URL、资源类型、MIME、来源页面，以及真实下载文件名和大小。",
+            )
+            .color(palette.blue),
+        );
         ui.separator();
         ui.label(
             egui::RichText::new(
-                "HTTPS 正文、URL 路径、消息、文件内容与账号信息由 TLS 加密，本工具不会安装证书、注入进程或解密通信。",
+                "HTTPS 正文仍保持加密；工具不安装中间人证书、不读取消息正文或文件内容。",
             )
-            .color(palette.text),
+            .color(palette.muted),
         );
-        let detailed = totals.breakdown.bytes();
-        if totals.bytes > detailed {
-            ui.label(
-                egui::RichText::new(format!(
-                    "当前有 {} 的历史流量仅保留总量；方向与协议细分从 v0.4 起记录。",
-                    format_bytes(totals.bytes.saturating_sub(detailed))
-                ))
-                .small()
-                .color(palette.muted),
-            );
-        }
     });
 }
 
@@ -1417,7 +1352,6 @@ fn format_integer(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::TrafficBreakdown;
 
     fn device(name: &str, description: &str) -> CaptureDeviceInfo {
         CaptureDeviceInfo {
@@ -1465,16 +1399,10 @@ mod tests {
     }
 
     #[test]
-    fn detail_percentage_is_stable() {
-        let detail = TrafficBreakdown {
-            tcp_bytes: 75,
-            udp_bytes: 25,
-            ..TrafficBreakdown::default()
-        };
-        assert_eq!(
-            percentage(detail.tcp_bytes, detail.tcp_bytes + detail.udp_bytes),
-            75.0
-        );
+    fn metric_columns_follow_window_width() {
+        assert_eq!(responsive_metric_columns(1300.0), 5);
+        assert_eq!(responsive_metric_columns(900.0), 3);
+        assert_eq!(responsive_metric_columns(600.0), 2);
     }
 
     #[test]
