@@ -29,21 +29,18 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path("src/browser_ui.rs")
           text = path.read_text()
-          old_format = '''                egui::RichText::new(format!(
-                      "扩展只向本机 127.0.0.1:{} 发送元数据，不上传正文。",
-                      BROWSER_DIAGNOSTICS_PORT
-                  ))
-          '''
-          new_format = '''                egui::RichText::new(format!(
-                      "扩展只向本机 127.0.0.1:{BROWSER_DIAGNOSTICS_PORT} 发送元数据，不上传正文。"
-                  ))
-          '''
-          if old_format not in text:
+          text, count = re.subn(
+              r'"扩展只向本机 127\.0\.0\.1:\{\} 发送元数据，不上传正文。",\s*BROWSER_DIAGNOSTICS_PORT',
+              '"扩展只向本机 127.0.0.1:{BROWSER_DIAGNOSTICS_PORT} 发送元数据，不上传正文。"',
+              text,
+              count=1,
+          )
+          if count != 1:
               raise SystemExit("port format marker not found")
-          text = text.replace(old_format, new_format, 1)
 
           start = text.index("fn open_extension_folder()")
           end = text.index("\n#[cfg(test)]", start)
