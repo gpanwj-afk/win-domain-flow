@@ -1,10 +1,10 @@
 [package]
 name = "win-domain-flow"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
-description = "Lightweight Windows domain-level network byte monitor"
+description = "Windows application and domain-level network traffic monitor"
 repository = "https://github.com/gpanwj-afk/win-domain-flow"
 publish = false
 default-run = "win-domain-flow-gui"
@@ -30,6 +30,10 @@ etherparse = "=0.21.0"
 pcap = "=2.4.0"
 rusqlite = { version = "=0.32.1", features = ["bundled"] }
 thiserror = "=2.0.18"
+
+[target.'cfg(windows)'.dependencies]
+netstat2 = "=0.11.2"
+sysinfo = "=0.37.2"
 
 [lints.rust]
 unsafe_code = "forbid"
