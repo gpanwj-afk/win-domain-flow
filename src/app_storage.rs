@@ -504,17 +504,20 @@ fn migrate_historical_rows(conn: &mut Connection) -> Result<(), ApplicationStora
         return Ok(());
     }
 
+    let should_import_legacy_totals = current.is_none();
     let tx = conn.transaction()?;
-    tx.execute(
-        "INSERT INTO application_domain_daily (
-            day_start_utc, application, domain, bytes, packets, updated_at_utc
-         )
-         SELECT day_start_utc, ?1, domain, bytes, packets, updated_at_utc
-         FROM domain_daily
-         WHERE true
-         ON CONFLICT(day_start_utc, application, domain) DO NOTHING",
-        [HISTORICAL_APPLICATION],
-    )?;
+    if should_import_legacy_totals {
+        tx.execute(
+            "INSERT INTO application_domain_daily (
+                day_start_utc, application, domain, bytes, packets, updated_at_utc
+             )
+             SELECT day_start_utc, ?1, domain, bytes, packets, updated_at_utc
+             FROM domain_daily
+             WHERE true
+             ON CONFLICT(day_start_utc, application, domain) DO NOTHING",
+            [HISTORICAL_APPLICATION],
+        )?;
+    }
     tx.execute(
         "INSERT INTO schema_meta (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -738,6 +741,57 @@ mod tests {
         assert_eq!(apps[0].application, HISTORICAL_APPLICATION);
         assert_eq!(apps[0].bytes, 100);
         assert!(details[0].breakdown.is_empty());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn v03_upgrade_does_not_reimport_domain_totals() {
+        let path = temp_db_path("v03_upgrade");
+        let mut domain_storage = Storage::open(&path).unwrap();
+        domain_storage
+            .upsert_batch(&FlushBatch {
+                rows: vec![DomainDelta {
+                    day_start_utc: 86_400,
+                    domain: "example.com".to_string(),
+                    counters: Counters {
+                        bytes: 100,
+                        packets: 1,
+                    },
+                }],
+            })
+            .unwrap();
+        drop(domain_storage);
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(APP_SCHEMA_SQL).unwrap();
+        conn.execute(
+            "INSERT INTO application_domain_daily (
+            day_start_utc, application, domain, bytes, packets, updated_at_utc
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                86_400_i64,
+                "chrome.exe",
+                "example.com",
+                100_i64,
+                1_i64,
+                0_i64
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO schema_meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![APP_SCHEMA_META_KEY, "1"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage = ApplicationStorage::open(&path).unwrap();
+        let apps = storage.top_applications(TrafficPeriod::All, 10).unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].application, "chrome.exe");
+        assert_eq!(apps[0].bytes, 100);
+        assert_eq!(storage.totals(TrafficPeriod::All).unwrap().bytes, 100);
         cleanup(&path);
     }
 
