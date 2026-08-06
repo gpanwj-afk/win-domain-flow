@@ -36,8 +36,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Format and regenerate lockfile
+      - name: Apply compiler fixes and regenerate lockfile
         run: |
+          cargo fix --lib -p win-domain-flow --allow-dirty
           cargo fmt
           cargo check --all-targets
       - name: Test
