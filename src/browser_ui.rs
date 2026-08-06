@@ -260,7 +260,7 @@ impl BrowserDiagnosticsPane {
             );
             ui.label(
                 egui::RichText::new(
-                    "按 document、media、fetch、script、image 等请求类型归类；大小为响应头声明值，并非所有请求都提供。",
+                    "按 document、media、fetch、script、image 等请求类型归类；优先使用浏览器记录的实际编码传输字节。",
                 )
                 .small()
                 .color(palette.muted),
@@ -275,12 +275,12 @@ impl BrowserDiagnosticsPane {
             let max_bytes = self
                 .summary
                 .iter()
-                .map(|row| row.declared_bytes)
+                .map(|row| row.measured_bytes)
                 .max()
                 .unwrap_or(1)
                 .max(1);
             for row in &self.summary {
-                let ratio = row.declared_bytes as f32 / max_bytes as f32;
+                let ratio = row.measured_bytes as f32 / max_bytes as f32;
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(resource_type_label(&row.resource_type))
@@ -289,7 +289,7 @@ impl BrowserDiagnosticsPane {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            egui::RichText::new(format_bytes(row.declared_bytes))
+                            egui::RichText::new(format_bytes(row.measured_bytes))
                                 .color(palette.blue),
                         );
                     });
@@ -301,7 +301,7 @@ impl BrowserDiagnosticsPane {
                 );
                 ui.label(
                     egui::RichText::new(format!(
-                        "{} 次请求 · {} 次大小未知",
+                        "{} 次请求 · {} 次大小未知（实际字节缺失时回退响应声明）",
                         format_integer(row.requests),
                         format_integer(row.unknown_size_requests)
                     ))
@@ -322,7 +322,7 @@ impl BrowserDiagnosticsPane {
             );
             ui.label(
                 egui::RichText::new(
-                    "用 URL 路径、资源类型、MIME、状态码与来源页面判断大流量是视频分片、接口数据、脚本、图片还是其他资源。",
+                    "按实际传输字节从大到小排列 URL，再结合资源类型、MIME、协议、缓存状态与来源页面判断用途。",
                 )
                 .small()
                 .color(palette.muted),
@@ -509,15 +509,14 @@ fn request_card(ui: &mut egui::Ui, row: &BrowserRequestRow, palette: BrowserPale
                 )
                 .on_hover_text(&row.url);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(
-                            row.declared_bytes
-                                .map(format_bytes)
-                                .unwrap_or_else(|| "响应大小未知".to_string()),
-                        )
-                        .strong()
-                        .color(palette.blue),
-                    );
+                    let (size_label, size_color) = if let Some(bytes) = row.transferred_bytes {
+                        (format!("实际传输 {}", format_bytes(bytes)), palette.blue)
+                    } else if let Some(bytes) = row.declared_bytes {
+                        (format!("响应声明 {}", format_bytes(bytes)), palette.amber)
+                    } else {
+                        ("大小未知".to_string(), palette.muted)
+                    };
+                    ui.label(egui::RichText::new(size_label).strong().color(size_color));
                 });
             });
             ui.horizontal_wrapped(|ui| {
@@ -541,6 +540,12 @@ fn request_card(ui: &mut egui::Ui, row: &BrowserRequestRow, palette: BrowserPale
                         },
                         palette,
                     );
+                }
+                if let Some(protocol) = &row.protocol {
+                    status_chip(ui, protocol, palette.blue, palette);
+                }
+                if row.from_cache == Some(true) {
+                    status_chip(ui, "来自缓存", palette.amber, palette);
                 }
                 if let Some(method) = &row.method {
                     status_chip(ui, method, palette.muted, palette);

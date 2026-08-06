@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS browser_request_event (
     status_code INTEGER,
     mime TEXT,
     declared_bytes INTEGER,
+    transferred_bytes INTEGER,
+    protocol TEXT,
+    from_cache INTEGER,
     content_disposition TEXT,
     error_text TEXT
 );
@@ -104,6 +107,12 @@ pub struct BrowserEventPayload {
     #[serde(default)]
     pub declared_bytes: Option<i64>,
     #[serde(default)]
+    pub transferred_bytes: Option<i64>,
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub from_cache: Option<bool>,
+    #[serde(default)]
     pub content_disposition: Option<String>,
     #[serde(default)]
     pub error_text: Option<String>,
@@ -138,12 +147,14 @@ impl BrowserEventPayload {
         self.method = normalize_optional(self.method);
         self.resource_type = normalize_optional(self.resource_type);
         self.mime = normalize_optional(self.mime);
+        self.protocol = normalize_optional(self.protocol);
         self.content_disposition = normalize_optional(self.content_disposition);
         self.error_text = normalize_optional(self.error_text);
         self.filename = normalize_optional(self.filename);
         self.state = normalize_optional(self.state);
         self.danger = normalize_optional(self.danger);
         self.declared_bytes = nonnegative_optional(self.declared_bytes);
+        self.transferred_bytes = nonnegative_optional(self.transferred_bytes);
         self.total_bytes = nonnegative_optional(self.total_bytes);
         Ok(self)
     }
@@ -161,6 +172,9 @@ pub struct BrowserRequestRow {
     pub status_code: Option<i64>,
     pub mime: Option<String>,
     pub declared_bytes: Option<u64>,
+    pub transferred_bytes: Option<u64>,
+    pub protocol: Option<String>,
+    pub from_cache: Option<bool>,
     pub content_disposition: Option<String>,
     pub error_text: Option<String>,
 }
@@ -185,7 +199,8 @@ pub struct BrowserDownloadRow {
 pub struct BrowserResourceSummaryRow {
     pub resource_type: String,
     pub requests: u64,
-    pub declared_bytes: u64,
+    pub measured_bytes: u64,
+    pub fallback_size_requests: u64,
     pub unknown_size_requests: u64,
 }
 
@@ -201,6 +216,7 @@ impl BrowserActivityStorage {
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA_SQL)?;
+        ensure_request_columns(&conn)?;
         Ok(Self { conn })
     }
 
@@ -213,46 +229,58 @@ impl BrowserActivityStorage {
         }
     }
 
-    fn record_request(&mut self, payload: &BrowserEventPayload) -> Result<(), BrowserActivityError> {
+    fn record_request(
+        &mut self,
+        payload: &BrowserEventPayload,
+    ) -> Result<(), BrowserActivityError> {
         self.conn.execute(
-            r#"INSERT INTO browser_request_event (
-                event_id, occurred_at_ms, host, url, page_url, initiator, method,
-                resource_type, status_code, mime, declared_bytes,
-                content_disposition, error_text
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-            ON CONFLICT(event_id) DO UPDATE SET
-                occurred_at_ms = excluded.occurred_at_ms,
-                host = excluded.host,
-                url = excluded.url,
-                page_url = excluded.page_url,
-                initiator = excluded.initiator,
-                method = excluded.method,
-                resource_type = excluded.resource_type,
-                status_code = excluded.status_code,
-                mime = excluded.mime,
-                declared_bytes = excluded.declared_bytes,
-                content_disposition = excluded.content_disposition,
-                error_text = excluded.error_text"#,
-            params![
-                payload.event_id,
-                payload.timestamp_ms,
-                payload.host,
-                payload.url,
-                payload.page_url,
-                payload.initiator,
-                payload.method,
-                payload.resource_type,
-                payload.status_code,
-                payload.mime,
-                payload.declared_bytes,
-                payload.content_disposition,
-                payload.error_text,
-            ],
-        )?;
+        r#"INSERT INTO browser_request_event (
+            event_id, occurred_at_ms, host, url, page_url, initiator, method,
+            resource_type, status_code, mime, declared_bytes, transferred_bytes,
+            protocol, from_cache, content_disposition, error_text
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+        ON CONFLICT(event_id) DO UPDATE SET
+            occurred_at_ms = excluded.occurred_at_ms,
+            host = excluded.host,
+            url = excluded.url,
+            page_url = excluded.page_url,
+            initiator = excluded.initiator,
+            method = excluded.method,
+            resource_type = excluded.resource_type,
+            status_code = excluded.status_code,
+            mime = excluded.mime,
+            declared_bytes = COALESCE(excluded.declared_bytes, browser_request_event.declared_bytes),
+            transferred_bytes = COALESCE(excluded.transferred_bytes, browser_request_event.transferred_bytes),
+            protocol = COALESCE(excluded.protocol, browser_request_event.protocol),
+            from_cache = COALESCE(excluded.from_cache, browser_request_event.from_cache),
+            content_disposition = COALESCE(excluded.content_disposition, browser_request_event.content_disposition),
+            error_text = excluded.error_text"#,
+        params![
+            payload.event_id,
+            payload.timestamp_ms,
+            payload.host,
+            payload.url,
+            payload.page_url,
+            payload.initiator,
+            payload.method,
+            payload.resource_type,
+            payload.status_code,
+            payload.mime,
+            payload.declared_bytes,
+            payload.transferred_bytes,
+            payload.protocol,
+            payload.from_cache.map(i64::from),
+            payload.content_disposition,
+            payload.error_text,
+        ],
+    )?;
         Ok(())
     }
 
-    fn record_download(&mut self, payload: &BrowserEventPayload) -> Result<(), BrowserActivityError> {
+    fn record_download(
+        &mut self,
+        payload: &BrowserEventPayload,
+    ) -> Result<(), BrowserActivityError> {
         self.conn.execute(
             r#"INSERT INTO browser_download_event (
                 event_id, updated_at_ms, started_at_ms, ended_at_ms, host, url,
@@ -299,31 +327,38 @@ impl BrowserActivityStorage {
         let host = normalized_filter(host_filter);
         let mut statement = self.conn.prepare(
             r#"SELECT occurred_at_ms, host, url, page_url, initiator, method,
-                      resource_type, status_code, mime, declared_bytes,
-                      content_disposition, error_text
-               FROM browser_request_event
-               WHERE occurred_at_ms >= ?1
-                 AND (?2 = '' OR host = ?2)
-               ORDER BY occurred_at_ms DESC
-               LIMIT ?3"#,
+                  resource_type, status_code, mime, declared_bytes, transferred_bytes,
+                  protocol, from_cache, content_disposition, error_text
+           FROM browser_request_event
+           WHERE occurred_at_ms >= ?1
+             AND (?2 = '' OR host = ?2)
+           ORDER BY COALESCE(transferred_bytes, declared_bytes, 0) DESC,
+                    occurred_at_ms DESC
+           LIMIT ?3"#,
         )?;
         let rows = statement
-            .query_map(params![since_ms, host, i64::from(limit.clamp(1, 500))], |row| {
-                Ok(BrowserRequestRow {
-                    occurred_at_ms: row.get(0)?,
-                    host: row.get(1)?,
-                    url: row.get(2)?,
-                    page_url: row.get(3)?,
-                    initiator: row.get(4)?,
-                    method: row.get(5)?,
-                    resource_type: row.get(6)?,
-                    status_code: row.get(7)?,
-                    mime: row.get(8)?,
-                    declared_bytes: optional_nonnegative(row.get(9)?),
-                    content_disposition: row.get(10)?,
-                    error_text: row.get(11)?,
-                })
-            })?
+            .query_map(
+                params![since_ms, host, i64::from(limit.clamp(1, 500))],
+                |row| {
+                    Ok(BrowserRequestRow {
+                        occurred_at_ms: row.get(0)?,
+                        host: row.get(1)?,
+                        url: row.get(2)?,
+                        page_url: row.get(3)?,
+                        initiator: row.get(4)?,
+                        method: row.get(5)?,
+                        resource_type: row.get(6)?,
+                        status_code: row.get(7)?,
+                        mime: row.get(8)?,
+                        declared_bytes: optional_nonnegative(row.get(9)?),
+                        transferred_bytes: optional_nonnegative(row.get(10)?),
+                        protocol: row.get(11)?,
+                        from_cache: row.get::<_, Option<i64>>(12)?.map(|value| value != 0),
+                        content_disposition: row.get(13)?,
+                        error_text: row.get(14)?,
+                    })
+                },
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -345,22 +380,25 @@ impl BrowserActivityStorage {
                LIMIT ?3"#,
         )?;
         let rows = statement
-            .query_map(params![since_ms, host, i64::from(limit.clamp(1, 200))], |row| {
-                Ok(BrowserDownloadRow {
-                    updated_at_ms: row.get(0)?,
-                    started_at_ms: row.get(1)?,
-                    ended_at_ms: row.get(2)?,
-                    host: row.get(3)?,
-                    url: row.get(4)?,
-                    final_url: row.get(5)?,
-                    filename: row.get(6)?,
-                    mime: row.get(7)?,
-                    total_bytes: optional_nonnegative(row.get(8)?),
-                    state: row.get(9)?,
-                    danger: row.get(10)?,
-                    exists_local: row.get::<_, Option<i64>>(11)?.map(|value| value != 0),
-                })
-            })?
+            .query_map(
+                params![since_ms, host, i64::from(limit.clamp(1, 200))],
+                |row| {
+                    Ok(BrowserDownloadRow {
+                        updated_at_ms: row.get(0)?,
+                        started_at_ms: row.get(1)?,
+                        ended_at_ms: row.get(2)?,
+                        host: row.get(3)?,
+                        url: row.get(4)?,
+                        final_url: row.get(5)?,
+                        filename: row.get(6)?,
+                        mime: row.get(7)?,
+                        total_bytes: optional_nonnegative(row.get(8)?),
+                        state: row.get(9)?,
+                        danger: row.get(10)?,
+                        exists_local: row.get::<_, Option<i64>>(11)?.map(|value| value != 0),
+                    })
+                },
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -373,26 +411,31 @@ impl BrowserActivityStorage {
     ) -> Result<Vec<BrowserResourceSummaryRow>, BrowserActivityError> {
         let host = normalized_filter(host_filter);
         let mut statement = self.conn.prepare(
-            r#"SELECT COALESCE(NULLIF(resource_type, ''), 'other'),
-                      COUNT(*),
-                      COALESCE(SUM(COALESCE(declared_bytes, 0)), 0),
-                      SUM(CASE WHEN declared_bytes IS NULL THEN 1 ELSE 0 END)
-               FROM browser_request_event
-               WHERE occurred_at_ms >= ?1
-                 AND (?2 = '' OR host = ?2)
-               GROUP BY COALESCE(NULLIF(resource_type, ''), 'other')
-               ORDER BY SUM(COALESCE(declared_bytes, 0)) DESC, COUNT(*) DESC
-               LIMIT ?3"#,
-        )?;
+        r#"SELECT COALESCE(NULLIF(resource_type, ''), 'other'),
+                  COUNT(*),
+                  COALESCE(SUM(COALESCE(transferred_bytes, declared_bytes, 0)), 0),
+                  SUM(CASE WHEN transferred_bytes IS NULL AND declared_bytes IS NOT NULL THEN 1 ELSE 0 END),
+                  SUM(CASE WHEN transferred_bytes IS NULL AND declared_bytes IS NULL THEN 1 ELSE 0 END)
+           FROM browser_request_event
+           WHERE occurred_at_ms >= ?1
+             AND (?2 = '' OR host = ?2)
+           GROUP BY COALESCE(NULLIF(resource_type, ''), 'other')
+           ORDER BY SUM(COALESCE(transferred_bytes, declared_bytes, 0)) DESC, COUNT(*) DESC
+           LIMIT ?3"#,
+    )?;
         let rows = statement
-            .query_map(params![since_ms, host, i64::from(limit.clamp(1, 50))], |row| {
-                Ok(BrowserResourceSummaryRow {
-                    resource_type: row.get(0)?,
-                    requests: nonnegative(row.get(1)?),
-                    declared_bytes: nonnegative(row.get(2)?),
-                    unknown_size_requests: nonnegative(row.get(3)?),
-                })
-            })?
+            .query_map(
+                params![since_ms, host, i64::from(limit.clamp(1, 50))],
+                |row| {
+                    Ok(BrowserResourceSummaryRow {
+                        resource_type: row.get(0)?,
+                        requests: nonnegative(row.get(1)?),
+                        measured_bytes: nonnegative(row.get(2)?),
+                        fallback_size_requests: nonnegative(row.get(3)?),
+                        unknown_size_requests: nonnegative(row.get(4)?),
+                    })
+                },
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -403,9 +446,10 @@ impl BrowserActivityStorage {
     ) -> Result<i64, BrowserActivityError> {
         let storage = ApplicationStorage::open(database_path)
             .map_err(|error| BrowserActivityError::Io(std::io::Error::other(error)))?;
-        Ok(storage.period_start_utc(period).map_err(|error| {
-            BrowserActivityError::Io(std::io::Error::other(error))
-        })? * 1_000)
+        Ok(storage
+            .period_start_utc(period)
+            .map_err(|error| BrowserActivityError::Io(std::io::Error::other(error)))?
+            * 1_000)
     }
 }
 
@@ -424,6 +468,7 @@ pub struct BrowserActivityServer {
     last_event_ms: Arc<AtomicU64>,
     last_error: Arc<Mutex<Option<String>>>,
     database_path: Arc<RwLock<PathBuf>>,
+    port: u16,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -476,6 +521,7 @@ impl BrowserActivityServer {
                                             &mut stream,
                                             500,
                                             r#"{"ok":false,"error":"database unavailable"}"#,
+                                            None,
                                         );
                                         continue;
                                     }
@@ -496,6 +542,7 @@ impl BrowserActivityServer {
                                         &mut stream,
                                         400,
                                         r#"{"ok":false,"error":"invalid event"}"#,
+                                        None,
                                     );
                                 }
                             }
@@ -519,6 +566,7 @@ impl BrowserActivityServer {
             last_event_ms,
             last_error,
             database_path,
+            port,
             handle: Some(handle),
         })
     }
@@ -541,9 +589,11 @@ impl BrowserActivityServer {
 
     pub fn shutdown(mut self) -> Result<(), BrowserActivityError> {
         self.shutdown.store(true, Ordering::SeqCst);
-        let _ = TcpStream::connect(("127.0.0.1", BROWSER_DIAGNOSTICS_PORT));
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
         if let Some(handle) = self.handle.take() {
-            handle.join().map_err(|_| BrowserActivityError::ThreadPanicked)?;
+            handle
+                .join()
+                .map_err(|_| BrowserActivityError::ThreadPanicked)?;
         }
         Ok(())
     }
@@ -552,7 +602,7 @@ impl BrowserActivityServer {
 impl Drop for BrowserActivityServer {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        let _ = TcpStream::connect(("127.0.0.1", BROWSER_DIAGNOSTICS_PORT));
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -566,17 +616,23 @@ fn handle_connection(
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let request = read_http_request(stream)?;
+    let allowed_origin = allowed_extension_origin(request.origin.as_deref())?;
 
     if request.method == "OPTIONS" {
-        write_empty_response(stream, 204)?;
+        write_empty_response(stream, 204, allowed_origin.as_deref())?;
         return Ok(false);
     }
     if request.method == "GET" && request.path == "/health" {
-        write_json_response(stream, 200, r#"{"ok":true}"#)?;
+        write_json_response(stream, 200, r#"{"ok":true}"#, allowed_origin.as_deref())?;
         return Ok(false);
     }
     if request.method != "POST" || request.path != "/events" {
-        write_json_response(stream, 404, r#"{"ok":false,"error":"not found"}"#)?;
+        write_json_response(
+            stream,
+            404,
+            r#"{"ok":false,"error":"not found"}"#,
+            allowed_origin.as_deref(),
+        )?;
         return Ok(false);
     }
 
@@ -585,13 +641,14 @@ fn handle_connection(
         return Err(BrowserActivityError::Protocol("database not initialized"));
     };
     storage.record(payload)?;
-    write_json_response(stream, 200, r#"{"ok":true}"#)?;
+    write_json_response(stream, 200, r#"{"ok":true}"#, allowed_origin.as_deref())?;
     Ok(true)
 }
 
 struct HttpRequest {
     method: String,
     path: String,
+    origin: Option<String>,
     body: Vec<u8>,
 }
 
@@ -632,6 +689,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, BrowserActiv
         .to_string();
 
     let mut content_length = 0_usize;
+    let mut origin = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -641,6 +699,8 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, BrowserActiv
                 .trim()
                 .parse::<usize>()
                 .map_err(|_| BrowserActivityError::Protocol("invalid content length"))?;
+        } else if name.trim().eq_ignore_ascii_case("origin") {
+            origin = Some(clamp_text(value.trim()));
         }
     }
     if content_length > MAX_EVENT_BYTES {
@@ -655,17 +715,53 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, BrowserActiv
         data.extend_from_slice(&buffer[..read]);
     }
     let body = data[header_end..header_end + content_length].to_vec();
-    Ok(HttpRequest { method, path, body })
+    Ok(HttpRequest {
+        method,
+        path,
+        origin,
+        body,
+    })
+}
+
+fn allowed_extension_origin(origin: Option<&str>) -> Result<Option<String>, BrowserActivityError> {
+    let Some(origin) = origin.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let valid = ["chrome-extension://", "edge-extension://"]
+        .iter()
+        .find_map(|prefix| origin.strip_prefix(prefix))
+        .map(|extension_id| {
+            let extension_id = extension_id.trim_end_matches('/');
+            !extension_id.is_empty() && !extension_id.contains('/')
+        })
+        .unwrap_or(false);
+    if valid {
+        Ok(Some(origin.to_string()))
+    } else {
+        Err(BrowserActivityError::Protocol("origin is not an extension"))
+    }
+}
+
+fn cors_headers(origin: Option<&str>) -> String {
+    origin.map_or_else(String::new, |origin| {
+        format!(
+            "Access-Control-Allow-Origin: {origin}
+Vary: Origin
+"
+        )
+    })
 }
 
 fn write_json_response(
     stream: &mut TcpStream,
     status: u16,
     body: &str,
+    origin: Option<&str>,
 ) -> Result<(), BrowserActivityError> {
     let reason = status_reason(status);
+    let cors = cors_headers(origin);
     let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n{cors}Access-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes())?;
@@ -673,10 +769,15 @@ fn write_json_response(
     Ok(())
 }
 
-fn write_empty_response(stream: &mut TcpStream, status: u16) -> Result<(), BrowserActivityError> {
+fn write_empty_response(
+    stream: &mut TcpStream,
+    status: u16,
+    origin: Option<&str>,
+) -> Result<(), BrowserActivityError> {
     let reason = status_reason(status);
+    let cors = cors_headers(origin);
     let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n{cors}Access-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n"
     );
     stream.write_all(response.as_bytes())?;
     stream.flush()?;
@@ -695,7 +796,28 @@ fn status_reason(status: u16) -> &'static str {
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn ensure_request_columns(conn: &Connection) -> Result<(), BrowserActivityError> {
+    let mut statement = conn.prepare("PRAGMA table_info(browser_request_event)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (name, declaration) in [
+        ("transferred_bytes", "INTEGER"),
+        ("protocol", "TEXT"),
+        ("from_cache", "INTEGER"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE browser_request_event ADD COLUMN {name} {declaration}"
+            ))?;
+        }
+    }
+    Ok(())
 }
 
 fn normalize_required(value: String, field: &'static str) -> Result<String, BrowserActivityError> {
@@ -796,6 +918,9 @@ mod tests {
             status_code: Some(200),
             mime: Some("application/octet-stream".to_string()),
             declared_bytes: Some(4096),
+            transferred_bytes: Some(8192),
+            protocol: Some("h2".to_string()),
+            from_cache: Some(false),
             content_disposition: None,
             error_text: None,
             filename: None,
@@ -814,17 +939,18 @@ mod tests {
         let mut storage = BrowserActivityStorage::open(&path).unwrap();
         storage.record(request_payload()).unwrap();
 
-        let rows = storage
-            .recent_requests(Some("example.com"), 0, 10)
-            .unwrap();
+        let rows = storage.recent_requests(Some("example.com"), 0, 10).unwrap();
         let summary = storage
             .resource_summary(Some("example.com"), 0, 10)
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].host, "example.com");
         assert_eq!(rows[0].declared_bytes, Some(4096));
+        assert_eq!(rows[0].transferred_bytes, Some(8192));
+        assert_eq!(rows[0].protocol.as_deref(), Some("h2"));
         assert_eq!(summary[0].resource_type, "fetch");
-        assert_eq!(summary[0].declared_bytes, 4096);
+        assert_eq!(summary[0].measured_bytes, 8192);
+        assert_eq!(summary[0].fallback_size_requests, 0);
         cleanup(&path);
     }
 
@@ -851,7 +977,10 @@ mod tests {
             .recent_downloads(Some("example.com"), 0, 10)
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].filename.as_deref(), Some(r"C:\Downloads\report.zip"));
+        assert_eq!(
+            rows[0].filename.as_deref(),
+            Some(r"C:\Downloads\report.zip")
+        );
         assert_eq!(rows[0].total_bytes, Some(5000));
         assert_eq!(rows[0].state.as_deref(), Some("complete"));
         cleanup(&path);
@@ -874,15 +1003,73 @@ mod tests {
         );
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let client = thread::spawn(move || {
             let mut stream = TcpStream::connect(address).unwrap();
             stream.write_all(request.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
         });
         let (mut stream, _) = listener.accept().unwrap();
         let parsed = read_http_request(&mut stream).unwrap();
+        release_tx.send(()).unwrap();
         client.join().unwrap();
         assert_eq!(parsed.method, "POST");
         assert_eq!(parsed.path, "/events");
+        assert_eq!(parsed.origin, None);
         assert_eq!(parsed.body, body);
+    }
+
+    #[test]
+    fn only_extension_origins_are_allowed() {
+        assert_eq!(
+            allowed_extension_origin(Some("chrome-extension://abcdefghijklmnop"))
+                .unwrap()
+                .as_deref(),
+            Some("chrome-extension://abcdefghijklmnop")
+        );
+        assert!(allowed_extension_origin(Some("https://example.com")).is_err());
+        assert_eq!(allowed_extension_origin(None).unwrap(), None);
+    }
+
+    #[test]
+    fn existing_request_table_is_migrated_with_detail_columns() {
+        let path = temp_db_path("schema_upgrade");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE browser_request_event (
+                event_id TEXT PRIMARY KEY,
+                occurred_at_ms INTEGER NOT NULL,
+                host TEXT NOT NULL,
+                url TEXT NOT NULL,
+                page_url TEXT,
+                initiator TEXT,
+                method TEXT,
+                resource_type TEXT,
+                status_code INTEGER,
+                mime TEXT,
+                declared_bytes INTEGER,
+                content_disposition TEXT,
+                error_text TEXT
+            );",
+        )
+        .unwrap();
+        drop(conn);
+        let storage = BrowserActivityStorage::open(&path).unwrap();
+        let mut statement = storage
+            .conn
+            .prepare("PRAGMA table_info(browser_request_event)")
+            .unwrap();
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "transferred_bytes"));
+        assert!(columns.iter().any(|column| column == "protocol"));
+        assert!(columns.iter().any(|column| column == "from_cache"));
+        cleanup(&path);
     }
 }
