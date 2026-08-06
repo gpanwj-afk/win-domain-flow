@@ -209,6 +209,10 @@ mod windows_backend {
         }
     }
 
+    pub fn create() -> Box<dyn ProcessAttributor> {
+        Box::new(WindowsProcessAttributor::default())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -229,16 +233,12 @@ mod windows_backend {
             assert_eq!(map.get(&443), Some(&Some(10)));
         }
     }
-
-    pub fn create() -> Box<dyn ProcessAttributor> {
-        Box::new(WindowsProcessAttributor::default())
-    }
 }
 
 pub fn create_process_attributor() -> Box<dyn ProcessAttributor> {
     #[cfg(windows)]
     {
-        return windows_backend::create();
+        windows_backend::create()
     }
 
     #[cfg(not(windows))]
