@@ -2,8 +2,8 @@ use crate::app_runtime::{run_live_with_shutdown, ApplicationRunSummary};
 use crate::app_storage::{ApplicationStorage, TrafficPeriod};
 use crate::capture::{list_devices, CaptureDeviceInfo};
 use crate::model::{
-    TopApplicationRow, TopDomainDetailRow, TrafficBreakdown, TrafficTotals,
-    HISTORICAL_APPLICATION, UNKNOWN_APPLICATION, UNKNOWN_DOMAIN,
+    TopApplicationRow, TopDomainDetailRow, TrafficTotals, HISTORICAL_APPLICATION,
+    UNKNOWN_APPLICATION, UNKNOWN_DOMAIN,
 };
 use crate::runtime::RuntimeConfig;
 use crate::settings::{database_parent, product_data_dir, AppSettings, ThemeMode};
@@ -429,12 +429,7 @@ impl DashboardApp {
     }
 
     fn render_sidebar(&mut self, ui: &mut egui::Ui, palette: Palette) {
-        section_title(
-            ui,
-            "抓包控制",
-            "选择当前联网网卡后即可持续记录",
-            palette,
-        );
+        section_title(ui, "抓包控制", "选择当前联网网卡后即可持续记录", palette);
         card(ui, palette, |ui| {
             ui.label(egui::RichText::new("联网网卡").color(palette.muted));
             let selected_text = self
@@ -972,11 +967,7 @@ fn install_chinese_font(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-fn card<R>(
-    ui: &mut egui::Ui,
-    palette: Palette,
-    content: impl FnOnce(&mut egui::Ui) -> R,
-) -> R {
+fn card<R>(ui: &mut egui::Ui, palette: Palette, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::default()
         .fill(palette.card)
         .stroke(egui::Stroke::new(1.0, palette.border))
@@ -993,11 +984,7 @@ fn section_title(ui: &mut egui::Ui, title: &str, subtitle: &str, palette: Palett
             .strong()
             .color(palette.text),
     );
-    ui.label(
-        egui::RichText::new(subtitle)
-            .small()
-            .color(palette.muted),
-    );
+    ui.label(egui::RichText::new(subtitle).small().color(palette.muted));
     ui.add_space(6.0);
 }
 
@@ -1015,11 +1002,7 @@ fn metric_card(
         .inner_margin(egui::Margin::symmetric(15, 12))
         .show(ui, |ui| {
             ui.set_min_width(156.0);
-            ui.label(
-                egui::RichText::new(title)
-                    .small()
-                    .color(palette.muted),
-            );
+            ui.label(egui::RichText::new(title).small().color(palette.muted));
             ui.label(egui::RichText::new(value).size(22.0).strong().color(accent));
         });
 }
@@ -1193,17 +1176,14 @@ fn domain_detail_card(
         });
 }
 
-fn detail_chip(
-    ui: &mut egui::Ui,
-    text: &str,
-    color: egui::Color32,
-    palette: Palette,
-) {
+fn detail_chip(ui: &mut egui::Ui, text: &str, color: egui::Color32, palette: Palette) {
     egui::Frame::default()
-        .fill(color.gamma_multiply(match palette.text == egui::Color32::from_rgb(15, 23, 42) {
-            true => 0.10,
-            false => 0.18,
-        }))
+        .fill(
+            color.gamma_multiply(match palette.text == egui::Color32::from_rgb(15, 23, 42) {
+                true => 0.10,
+                false => 0.18,
+            }),
+        )
         .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.75)))
         .corner_radius(12)
         .inner_margin(egui::Margin::symmetric(9, 4))
@@ -1437,6 +1417,7 @@ fn format_integer(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::TrafficBreakdown;
 
     fn device(name: &str, description: &str) -> CaptureDeviceInfo {
         CaptureDeviceInfo {
@@ -1490,7 +1471,10 @@ mod tests {
             udp_bytes: 25,
             ..TrafficBreakdown::default()
         };
-        assert_eq!(percentage(detail.tcp_bytes, detail.tcp_bytes + detail.udp_bytes), 75.0);
+        assert_eq!(
+            percentage(detail.tcp_bytes, detail.tcp_bytes + detail.udp_bytes),
+            75.0
+        );
     }
 
     #[test]

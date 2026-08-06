@@ -123,9 +123,7 @@ impl TrafficBreakdown {
         self.upload_bytes = self.upload_bytes.saturating_add(other.upload_bytes);
         self.download_bytes = self.download_bytes.saturating_add(other.download_bytes);
         self.upload_packets = self.upload_packets.saturating_add(other.upload_packets);
-        self.download_packets = self
-            .download_packets
-            .saturating_add(other.download_packets);
+        self.download_packets = self.download_packets.saturating_add(other.download_packets);
         self.tcp_bytes = self.tcp_bytes.saturating_add(other.tcp_bytes);
         self.udp_bytes = self.udp_bytes.saturating_add(other.udp_bytes);
         self.tcp_packets = self.tcp_packets.saturating_add(other.tcp_packets);

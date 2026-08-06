@@ -403,9 +403,7 @@ impl ApplicationStorage {
         let lower_bound = self.period_start_utc(period)?;
 
         let rows = if let Some(application) = application {
-            let mut statement = self
-                .conn
-                .prepare(TOP_DOMAIN_DETAILS_FOR_APPLICATION_SQL)?;
+            let mut statement = self.conn.prepare(TOP_DOMAIN_DETAILS_FOR_APPLICATION_SQL)?;
             let mapped = statement.query_map(
                 params![lower_bound, application, i64::from(limit)],
                 map_domain_detail_row,

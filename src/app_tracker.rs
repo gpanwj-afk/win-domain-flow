@@ -42,12 +42,7 @@ impl ApplicationTracker {
         let application = normalize_application(application);
         if packet.flow.protocol == TransportProtocol::Udp {
             let upload = packet.destination.port == TLS_PORT;
-            return vec![packet_delta(
-                packet,
-                &application,
-                UNKNOWN_DOMAIN,
-                upload,
-            )];
+            return vec![packet_delta(packet, &application, UNKNOWN_DOMAIN, upload)];
         }
 
         let mut deltas = Vec::new();
