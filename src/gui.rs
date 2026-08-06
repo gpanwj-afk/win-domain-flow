@@ -536,9 +536,9 @@ fn status_badge(ui: &mut egui::Ui, state: &CaptureState) {
         CaptureState::Finished => ("Stopped", egui::Color32::LIGHT_BLUE),
         CaptureState::Failed(_) => ("Error", egui::Color32::LIGHT_RED),
     };
-    ui.colored_label(color, text);
+    let response = ui.colored_label(color, text);
     if let CaptureState::Failed(error) = state {
-        ui.on_hover_text(error);
+        response.on_hover_text(error);
     }
 }
 
