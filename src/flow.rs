@@ -285,9 +285,7 @@ fn inspect_tls(flow: &mut FlowState, tcp: &TcpMetadata, max_tls_buffer: usize) -
         InspectionState::Collecting(mut assembler) => {
             let sequence = tcp.sequence;
             if sequence == assembler.expected_next_sequence {
-                let Some(new_len) = assembler.bytes.len().checked_add(tcp.payload.len()) else {
-                    return None;
-                };
+                let new_len = assembler.bytes.len().checked_add(tcp.payload.len())?;
                 if new_len > max_tls_buffer {
                     return None;
                 }
