@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "域流量管家 · 浏览器活动诊断",
+  "version": "0.5.0",
+  "description": "将网页请求元数据和浏览器下载记录发送到本机域流量管家，不读取或上传 HTTPS 正文。",
+  "minimum_chrome_version": "109",
+  "permissions": [
+    "downloads",
+    "storage",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1:38765/*"
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "action": {
+    "default_title": "域流量管家 · 浏览器活动诊断",
+    "default_popup": "popup.html"
+  }
+}
