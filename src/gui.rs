@@ -100,9 +100,7 @@ struct DashboardApp {
 
 impl DashboardApp {
     fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
-        creation_context
-            .egui_ctx
-            .set_visuals(egui::Visuals::dark());
+        creation_context.egui_ctx.set_visuals(egui::Visuals::dark());
 
         let now = Instant::now();
         let mut app = Self {
@@ -212,10 +210,7 @@ impl DashboardApp {
     }
 
     fn poll_capture(&mut self) {
-        let result = self
-            .capture
-            .as_ref()
-            .and_then(CaptureWorker::try_result);
+        let result = self.capture.as_ref().and_then(CaptureWorker::try_result);
 
         let Some(mut result) = result else {
             return;
@@ -231,7 +226,8 @@ impl DashboardApp {
             Ok(summary) => {
                 self.last_summary = Some(summary);
                 self.state = CaptureState::Finished;
-                self.notice = Some("Capture stopped. Final traffic was flushed to SQLite.".to_string());
+                self.notice =
+                    Some("Capture stopped. Final traffic was flushed to SQLite.".to_string());
             }
             Err(error) => {
                 self.state = CaptureState::Failed(error.clone());
@@ -252,7 +248,8 @@ impl DashboardApp {
             return;
         }
 
-        match Storage::open(path).and_then(|storage| storage.top_domains_recent(self.days, self.limit))
+        match Storage::open(path)
+            .and_then(|storage| storage.top_domains_recent(self.days, self.limit))
         {
             Ok(rows) => {
                 self.rows = rows;
