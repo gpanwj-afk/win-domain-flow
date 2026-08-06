@@ -38,6 +38,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Apply compiler fixes and regenerate lockfile
         run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/gui.rs")
+          text = path.read_text()
+          old = '''#[cfg(test)]
+          mod tests {
+              use super::*;
+          '''
+          new = '''#[cfg(test)]
+          mod tests {
+              use super::*;
+              use crate::model::TrafficBreakdown;
+          '''
+          if old not in text:
+              raise SystemExit("GUI test module marker not found")
+          path.write_text(text.replace(old, new, 1))
+          PY
           cargo fix --lib -p win-domain-flow --allow-dirty
           cargo fmt
           cargo check --all-targets
