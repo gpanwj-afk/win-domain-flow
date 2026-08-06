@@ -1,6 +1,6 @@
 use crate::model::{
-    ApplicationFlushBatch, TopApplicationRow, TopDomainRow, TrafficTotals, HISTORICAL_APPLICATION,
-    UNKNOWN_APPLICATION, UNKNOWN_DOMAIN,
+    ApplicationFlushBatch, TopApplicationRow, TopDomainDetailRow, TopDomainRow, TrafficBreakdown,
+    TrafficTotals, HISTORICAL_APPLICATION, UNKNOWN_APPLICATION, UNKNOWN_DOMAIN,
 };
 use crate::storage::{Storage, StorageError};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -10,7 +10,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use thiserror::Error;
 
-const APP_SCHEMA_VERSION: &str = "1";
+const APP_SCHEMA_VERSION: &str = "2";
 const APP_SCHEMA_META_KEY: &str = "application_schema_version";
 const SQLITE_SYNCHRONOUS_NORMAL: i64 = 1;
 
@@ -35,6 +35,34 @@ CREATE TABLE IF NOT EXISTS application_domain_daily (
     PRIMARY KEY (day_start_utc, application, domain)
 ) WITHOUT ROWID;
 
+CREATE TABLE IF NOT EXISTS application_domain_detail_daily (
+    day_start_utc INTEGER NOT NULL
+        CHECK (day_start_utc % 86400 = 0),
+    application TEXT NOT NULL
+        CHECK (application <> ''),
+    domain TEXT NOT NULL
+        CHECK (domain <> ''),
+    upload_bytes INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(upload_bytes) = 'integer' AND upload_bytes >= 0),
+    download_bytes INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(download_bytes) = 'integer' AND download_bytes >= 0),
+    upload_packets INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(upload_packets) = 'integer' AND upload_packets >= 0),
+    download_packets INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(download_packets) = 'integer' AND download_packets >= 0),
+    tcp_bytes INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(tcp_bytes) = 'integer' AND tcp_bytes >= 0),
+    udp_bytes INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(udp_bytes) = 'integer' AND udp_bytes >= 0),
+    tcp_packets INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(tcp_packets) = 'integer' AND tcp_packets >= 0),
+    udp_packets INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(udp_packets) = 'integer' AND udp_packets >= 0),
+    updated_at_utc INTEGER NOT NULL
+        CHECK (typeof(updated_at_utc) = 'integer' AND updated_at_utc >= 0),
+    PRIMARY KEY (day_start_utc, application, domain)
+) WITHOUT ROWID;
+
 CREATE INDEX IF NOT EXISTS idx_application_daily_period_bytes
     ON application_domain_daily(day_start_utc, bytes DESC);
 
@@ -43,6 +71,9 @@ CREATE INDEX IF NOT EXISTS idx_application_daily_app_period
 
 CREATE INDEX IF NOT EXISTS idx_application_daily_domain_period
     ON application_domain_daily(domain, day_start_utc, bytes DESC);
+
+CREATE INDEX IF NOT EXISTS idx_application_detail_period
+    ON application_domain_detail_daily(day_start_utc, application, domain);
 ";
 
 const UPSERT_SQL: &str = "
@@ -58,6 +89,37 @@ VALUES (?1, ?2, ?3, ?4, ?5, CAST(strftime('%s','now') AS INTEGER))
 ON CONFLICT(day_start_utc, application, domain) DO UPDATE SET
     bytes = application_domain_daily.bytes + excluded.bytes,
     packets = application_domain_daily.packets + excluded.packets,
+    updated_at_utc = CAST(strftime('%s','now') AS INTEGER);
+";
+
+const DETAIL_UPSERT_SQL: &str = "
+INSERT INTO application_domain_detail_daily (
+    day_start_utc,
+    application,
+    domain,
+    upload_bytes,
+    download_bytes,
+    upload_packets,
+    download_packets,
+    tcp_bytes,
+    udp_bytes,
+    tcp_packets,
+    udp_packets,
+    updated_at_utc
+)
+VALUES (
+    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+    CAST(strftime('%s','now') AS INTEGER)
+)
+ON CONFLICT(day_start_utc, application, domain) DO UPDATE SET
+    upload_bytes = application_domain_detail_daily.upload_bytes + excluded.upload_bytes,
+    download_bytes = application_domain_detail_daily.download_bytes + excluded.download_bytes,
+    upload_packets = application_domain_detail_daily.upload_packets + excluded.upload_packets,
+    download_packets = application_domain_detail_daily.download_packets + excluded.download_packets,
+    tcp_bytes = application_domain_detail_daily.tcp_bytes + excluded.tcp_bytes,
+    udp_bytes = application_domain_detail_daily.udp_bytes + excluded.udp_bytes,
+    tcp_packets = application_domain_detail_daily.tcp_packets + excluded.tcp_packets,
+    udp_packets = application_domain_detail_daily.udp_packets + excluded.udp_packets,
     updated_at_utc = CAST(strftime('%s','now') AS INTEGER);
 ";
 
@@ -88,14 +150,74 @@ ORDER BY SUM(bytes) DESC, domain ASC
 LIMIT ?3;
 ";
 
+const TOP_DOMAIN_DETAILS_ALL_SQL: &str = "
+SELECT
+    base.domain,
+    SUM(base.bytes),
+    SUM(base.packets),
+    COALESCE(SUM(detail.upload_bytes), 0),
+    COALESCE(SUM(detail.download_bytes), 0),
+    COALESCE(SUM(detail.upload_packets), 0),
+    COALESCE(SUM(detail.download_packets), 0),
+    COALESCE(SUM(detail.tcp_bytes), 0),
+    COALESCE(SUM(detail.udp_bytes), 0),
+    COALESCE(SUM(detail.tcp_packets), 0),
+    COALESCE(SUM(detail.udp_packets), 0)
+FROM application_domain_daily AS base
+LEFT JOIN application_domain_detail_daily AS detail
+  ON detail.day_start_utc = base.day_start_utc
+ AND detail.application = base.application
+ AND detail.domain = base.domain
+WHERE base.day_start_utc >= ?1
+GROUP BY base.domain
+ORDER BY SUM(base.bytes) DESC, base.domain ASC
+LIMIT ?2;
+";
+
+const TOP_DOMAIN_DETAILS_FOR_APPLICATION_SQL: &str = "
+SELECT
+    base.domain,
+    SUM(base.bytes),
+    SUM(base.packets),
+    COALESCE(SUM(detail.upload_bytes), 0),
+    COALESCE(SUM(detail.download_bytes), 0),
+    COALESCE(SUM(detail.upload_packets), 0),
+    COALESCE(SUM(detail.download_packets), 0),
+    COALESCE(SUM(detail.tcp_bytes), 0),
+    COALESCE(SUM(detail.udp_bytes), 0),
+    COALESCE(SUM(detail.tcp_packets), 0),
+    COALESCE(SUM(detail.udp_packets), 0)
+FROM application_domain_daily AS base
+LEFT JOIN application_domain_detail_daily AS detail
+  ON detail.day_start_utc = base.day_start_utc
+ AND detail.application = base.application
+ AND detail.domain = base.domain
+WHERE base.day_start_utc >= ?1 AND base.application = ?2
+GROUP BY base.domain
+ORDER BY SUM(base.bytes) DESC, base.domain ASC
+LIMIT ?3;
+";
+
 const TOTALS_SQL: &str = "
 SELECT
-    COALESCE(SUM(bytes), 0),
-    COALESCE(SUM(packets), 0),
-    COALESCE(SUM(CASE WHEN domain = ?2 THEN bytes ELSE 0 END), 0),
-    COALESCE(SUM(CASE WHEN application IN (?3, ?4) THEN bytes ELSE 0 END), 0)
-FROM application_domain_daily
-WHERE day_start_utc >= ?1;
+    COALESCE(SUM(base.bytes), 0),
+    COALESCE(SUM(base.packets), 0),
+    COALESCE(SUM(CASE WHEN base.domain = ?2 THEN base.bytes ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN base.application IN (?3, ?4) THEN base.bytes ELSE 0 END), 0),
+    COALESCE(SUM(detail.upload_bytes), 0),
+    COALESCE(SUM(detail.download_bytes), 0),
+    COALESCE(SUM(detail.upload_packets), 0),
+    COALESCE(SUM(detail.download_packets), 0),
+    COALESCE(SUM(detail.tcp_bytes), 0),
+    COALESCE(SUM(detail.udp_bytes), 0),
+    COALESCE(SUM(detail.tcp_packets), 0),
+    COALESCE(SUM(detail.udp_packets), 0)
+FROM application_domain_daily AS base
+LEFT JOIN application_domain_detail_daily AS detail
+  ON detail.day_start_utc = base.day_start_utc
+ AND detail.application = base.application
+ AND detail.domain = base.domain
+WHERE base.day_start_utc >= ?1;
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,26 +315,32 @@ impl ApplicationStorage {
 
         let tx = self.conn.transaction()?;
         {
-            let mut statement = tx.prepare(UPSERT_SQL)?;
+            let mut total_statement = tx.prepare(UPSERT_SQL)?;
+            let mut detail_statement = tx.prepare(DETAIL_UPSERT_SQL)?;
             for row in &batch.rows {
-                let bytes = i64::try_from(row.counters.bytes).map_err(|_| {
-                    ApplicationStorageError::CounterTooLarge {
-                        application: row.application.clone(),
-                        domain: row.domain.clone(),
-                    }
-                })?;
-                let packets = i64::try_from(row.counters.packets).map_err(|_| {
-                    ApplicationStorageError::CounterTooLarge {
-                        application: row.application.clone(),
-                        domain: row.domain.clone(),
-                    }
-                })?;
-                statement.execute(params![
+                let bytes = checked_i64(row.counters.bytes, &row.application, &row.domain)?;
+                let packets = checked_i64(row.counters.packets, &row.application, &row.domain)?;
+                total_statement.execute(params![
                     row.day_start_utc,
                     row.application,
                     row.domain,
                     bytes,
                     packets
+                ])?;
+
+                let detail = row.breakdown;
+                detail_statement.execute(params![
+                    row.day_start_utc,
+                    row.application,
+                    row.domain,
+                    checked_i64(detail.upload_bytes, &row.application, &row.domain)?,
+                    checked_i64(detail.download_bytes, &row.application, &row.domain)?,
+                    checked_i64(detail.upload_packets, &row.application, &row.domain)?,
+                    checked_i64(detail.download_packets, &row.application, &row.domain)?,
+                    checked_i64(detail.tcp_bytes, &row.application, &row.domain)?,
+                    checked_i64(detail.udp_bytes, &row.application, &row.domain)?,
+                    checked_i64(detail.tcp_packets, &row.application, &row.domain)?,
+                    checked_i64(detail.udp_packets, &row.application, &row.domain)?,
                 ])?;
             }
         }
@@ -265,6 +393,35 @@ impl ApplicationStorage {
         Ok(rows)
     }
 
+    pub fn top_domain_details(
+        &self,
+        period: TrafficPeriod,
+        application: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<TopDomainDetailRow>, ApplicationStorageError> {
+        validate_limit(limit)?;
+        let lower_bound = self.period_start_utc(period)?;
+
+        let rows = if let Some(application) = application {
+            let mut statement = self
+                .conn
+                .prepare(TOP_DOMAIN_DETAILS_FOR_APPLICATION_SQL)?;
+            let mapped = statement.query_map(
+                params![lower_bound, application, i64::from(limit)],
+                map_domain_detail_row,
+            )?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        } else {
+            let mut statement = self.conn.prepare(TOP_DOMAIN_DETAILS_ALL_SQL)?;
+            let mapped = statement.query_map(
+                params![lower_bound, i64::from(limit)],
+                map_domain_detail_row,
+            )?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(rows)
+    }
+
     pub fn totals(&self, period: TrafficPeriod) -> Result<TrafficTotals, ApplicationStorageError> {
         let lower_bound = self.period_start_utc(period)?;
         self.conn
@@ -282,6 +439,16 @@ impl ApplicationStorage {
                         packets: nonnegative_u64(row.get(1)?),
                         unknown_domain_bytes: nonnegative_u64(row.get(2)?),
                         unknown_application_bytes: nonnegative_u64(row.get(3)?),
+                        breakdown: TrafficBreakdown {
+                            upload_bytes: nonnegative_u64(row.get(4)?),
+                            download_bytes: nonnegative_u64(row.get(5)?),
+                            upload_packets: nonnegative_u64(row.get(6)?),
+                            download_packets: nonnegative_u64(row.get(7)?),
+                            tcp_bytes: nonnegative_u64(row.get(8)?),
+                            udp_bytes: nonnegative_u64(row.get(9)?),
+                            tcp_packets: nonnegative_u64(row.get(10)?),
+                            udp_packets: nonnegative_u64(row.get(11)?),
+                        },
                     })
                 },
             )
@@ -359,6 +526,17 @@ fn migrate_historical_rows(conn: &mut Connection) -> Result<(), ApplicationStora
     Ok(())
 }
 
+fn checked_i64(
+    value: u64,
+    application: &str,
+    domain: &str,
+) -> Result<i64, ApplicationStorageError> {
+    i64::try_from(value).map_err(|_| ApplicationStorageError::CounterTooLarge {
+        application: application.to_string(),
+        domain: domain.to_string(),
+    })
+}
+
 fn validate_limit(limit: u32) -> Result<(), ApplicationStorageError> {
     if !(1..=1000).contains(&limit) {
         return Err(ApplicationStorageError::InvalidQuery(
@@ -373,6 +551,24 @@ fn map_domain_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TopDomainRow> {
         domain: row.get(0)?,
         bytes: nonnegative_u64(row.get(1)?),
         packets: nonnegative_u64(row.get(2)?),
+    })
+}
+
+fn map_domain_detail_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TopDomainDetailRow> {
+    Ok(TopDomainDetailRow {
+        domain: row.get(0)?,
+        bytes: nonnegative_u64(row.get(1)?),
+        packets: nonnegative_u64(row.get(2)?),
+        breakdown: TrafficBreakdown {
+            upload_bytes: nonnegative_u64(row.get(3)?),
+            download_bytes: nonnegative_u64(row.get(4)?),
+            upload_packets: nonnegative_u64(row.get(5)?),
+            download_packets: nonnegative_u64(row.get(6)?),
+            tcp_bytes: nonnegative_u64(row.get(7)?),
+            udp_bytes: nonnegative_u64(row.get(8)?),
+            tcp_packets: nonnegative_u64(row.get(9)?),
+            udp_packets: nonnegative_u64(row.get(10)?),
+        },
     })
 }
 
@@ -481,6 +677,7 @@ mod tests {
     use super::*;
     use crate::model::{
         ApplicationDomainDelta, ApplicationFlushBatch, Counters, DomainDelta, FlushBatch,
+        TrafficBreakdown, TransportProtocol,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -506,6 +703,16 @@ mod tests {
         let _ = fs::remove_file(path.with_extension("db-shm"));
     }
 
+    fn app_row(bytes: u64, upload: bool, protocol: TransportProtocol) -> ApplicationDomainDelta {
+        ApplicationDomainDelta {
+            day_start_utc: 86_400,
+            application: "chrome.exe".to_string(),
+            domain: "example.com".to_string(),
+            counters: Counters { bytes, packets: 1 },
+            breakdown: TrafficBreakdown::from_packet(bytes, upload, protocol),
+        }
+    }
+
     #[test]
     fn legacy_domain_rows_are_visible_as_historical_application() {
         let path = temp_db_path("migration");
@@ -526,35 +733,42 @@ mod tests {
 
         let storage = ApplicationStorage::open(&path).unwrap();
         let apps = storage.top_applications(TrafficPeriod::All, 10).unwrap();
+        let details = storage
+            .top_domain_details(TrafficPeriod::All, None, 10)
+            .unwrap();
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].application, HISTORICAL_APPLICATION);
         assert_eq!(apps[0].bytes, 100);
+        assert!(details[0].breakdown.is_empty());
         cleanup(&path);
     }
 
     #[test]
-    fn application_rows_are_additive_and_queryable() {
+    fn application_rows_and_details_are_additive_and_queryable() {
         let path = temp_db_path("additive");
         let mut storage = ApplicationStorage::open(&path).unwrap();
-        let row = |bytes| ApplicationDomainDelta {
-            day_start_utc: 86_400,
-            application: "chrome.exe".to_string(),
-            domain: "example.com".to_string(),
-            counters: Counters { bytes, packets: 1 },
-        };
         storage
             .upsert_batch(&ApplicationFlushBatch {
-                rows: vec![row(100), row(50)],
+                rows: vec![
+                    app_row(100, true, TransportProtocol::Tcp),
+                    app_row(50, false, TransportProtocol::Udp),
+                ],
             })
             .unwrap();
 
         let apps = storage.top_applications(TrafficPeriod::All, 10).unwrap();
         let domains = storage
-            .top_domains(TrafficPeriod::All, Some("chrome.exe"), 10)
+            .top_domain_details(TrafficPeriod::All, Some("chrome.exe"), 10)
             .unwrap();
+        let totals = storage.totals(TrafficPeriod::All).unwrap();
         assert_eq!(apps[0].bytes, 150);
         assert_eq!(domains[0].bytes, 150);
-        assert_eq!(storage.totals(TrafficPeriod::All).unwrap().packets, 2);
+        assert_eq!(domains[0].breakdown.upload_bytes, 100);
+        assert_eq!(domains[0].breakdown.download_bytes, 50);
+        assert_eq!(domains[0].breakdown.tcp_bytes, 100);
+        assert_eq!(domains[0].breakdown.udp_bytes, 50);
+        assert_eq!(totals.packets, 2);
+        assert_eq!(totals.breakdown.bytes(), 150);
         cleanup(&path);
     }
 
@@ -564,15 +778,7 @@ mod tests {
         let writer = ApplicationStorageWriter::spawn(path.clone()).unwrap();
         writer
             .submit(ApplicationFlushBatch {
-                rows: vec![ApplicationDomainDelta {
-                    day_start_utc: 86_400,
-                    application: "app.exe".to_string(),
-                    domain: "example.com".to_string(),
-                    counters: Counters {
-                        bytes: 42,
-                        packets: 1,
-                    },
-                }],
+                rows: vec![app_row(42, true, TransportProtocol::Tcp)],
             })
             .unwrap();
         writer.shutdown().unwrap();
