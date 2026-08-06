@@ -44,7 +44,7 @@ mod windows_backend {
     use std::time::{Duration, Instant};
     use sysinfo::{Pid, ProcessesToUpdate, System};
 
-    const CACHE_TTL: Duration = Duration::from_millis(500);
+    const CACHE_TTL: Duration = Duration::from_millis(250);
 
     pub struct WindowsProcessAttributor {
         last_refresh: Option<Instant>,
@@ -159,7 +159,7 @@ mod windows_backend {
 
     impl ProcessAttributor for WindowsProcessAttributor {
         fn lookup(&mut self, flow: &FlowKey) -> Result<Option<ProcessIdentity>, AttributionError> {
-            if self.cache_is_stale() || self.find_pid(flow).is_none() {
+            if self.cache_is_stale() {
                 self.refresh()?;
             }
 
