@@ -15,7 +15,7 @@ permissions:
 jobs:
   linux-quality:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
@@ -42,6 +42,33 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Validate browser extension syntax and policy
+        shell: bash
+        run: |
+          node --check browser-extension/service_worker.js
+          node --check browser-extension/popup.js
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(Path("browser-extension/manifest.json").read_text())
+          permissions = set(manifest.get("permissions", []))
+          hosts = manifest.get("host_permissions", [])
+          worker = Path("browser-extension/service_worker.js").read_text()
+
+          assert manifest.get("manifest_version") == 3
+          assert "debugger" in permissions
+          assert "downloads" in permissions
+          assert "webRequest" not in permissions
+          assert "<all_urls>" not in hosts
+          assert hosts == ["http://127.0.0.1:38765/*"]
+          assert "Network.dataReceived" in worker
+          assert "Network.loadingFinished" in worker
+          assert "Network.getResponseBody" not in worker
+          assert "127.0.0.1:38765" in worker
+          assert Path("browser-extension/README_CN.md").is_file()
+          PY
+
       - name: Format
         run: cargo fmt --check
 
@@ -64,7 +91,7 @@ jobs:
 
   windows-product:
     runs-on: windows-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
@@ -154,6 +181,7 @@ jobs:
           Copy-Item "$source\win-domain-flow.exe" $package
           Copy-Item "$source\win-domain-flow-gui.exe" $package
           Copy-Item README.md, INSTALL.md, INSTALL_CN.md $package
+          Copy-Item browser-extension "$package\browser-extension" -Recurse
 
           @'
           @echo off
@@ -166,7 +194,12 @@ jobs:
             "$package\README.md",
             "$package\INSTALL.md",
             "$package\INSTALL_CN.md",
-            "$package\Start-GUI-As-Administrator.cmd"
+            "$package\Start-GUI-As-Administrator.cmd",
+            "$package\browser-extension\manifest.json",
+            "$package\browser-extension\service_worker.js",
+            "$package\browser-extension\popup.html",
+            "$package\browser-extension\popup.js",
+            "$package\browser-extension\README_CN.md"
           )
           foreach ($item in $required) {
             if (!(Test-Path $item)) { throw "Package item missing: $item" }
@@ -178,4 +211,4 @@ jobs:
           name: win-domain-flow-windows-x64
           if-no-files-found: error
           retention-days: 14
-          path: dist/win-domain-flow-windows-x64/*
+          path: dist/win-domain-flow-windows-x64/**
