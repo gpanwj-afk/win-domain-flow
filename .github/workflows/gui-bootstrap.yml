@@ -1,0 +1,111 @@
+name: gui-bootstrap
+
+on:
+  push:
+    branches:
+      - agent/add-gui-dashboard
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/add-gui-dashboard
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt
+      - name: Add external shutdown runtime and refresh lockfile
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/runtime.rs")
+          text = path.read_text()
+          old = '''pub fn run_live(
+              interface: &str,
+              db_path: &Path,
+              config: RuntimeConfig,
+          ) -> Result<RunSummary, RuntimeError> {
+              config.validate()?;
+
+              let shutdown = Arc::new(AtomicBool::new(false));
+              let signal_flag = Arc::clone(&shutdown);
+              ctrlc::set_handler(move || {
+                  signal_flag.store(true, Ordering::SeqCst);
+              })?;
+
+              let live_config = crate::capture::LiveCaptureConfig {
+                  interface: interface.to_string(),
+                  bpf_filter: config.bpf_filter.clone(),
+                  snaplen: crate::model::DEFAULT_SNAPLEN,
+                  buffer_size: crate::model::DEFAULT_BUFFER_SIZE,
+                  timeout_ms: crate::model::DEFAULT_TIMEOUT_MS,
+              };
+
+              let mut source = crate::capture::open_live(&live_config)?;
+              let writer = StorageWriter::spawn(db_path.to_path_buf())?;
+
+              run_source(&mut source, writer, &config, &shutdown, false)
+          }
+          '''
+          new = '''pub fn run_live(
+              interface: &str,
+              db_path: &Path,
+              config: RuntimeConfig,
+          ) -> Result<RunSummary, RuntimeError> {
+              config.validate()?;
+
+              let shutdown = Arc::new(AtomicBool::new(false));
+              let signal_flag = Arc::clone(&shutdown);
+              ctrlc::set_handler(move || {
+                  signal_flag.store(true, Ordering::SeqCst);
+              })?;
+
+              run_live_with_shutdown(interface, db_path, config, shutdown)
+          }
+
+          pub fn run_live_with_shutdown(
+              interface: &str,
+              db_path: &Path,
+              config: RuntimeConfig,
+              shutdown: Arc<AtomicBool>,
+          ) -> Result<RunSummary, RuntimeError> {
+              config.validate()?;
+
+              let live_config = crate::capture::LiveCaptureConfig {
+                  interface: interface.to_string(),
+                  bpf_filter: config.bpf_filter.clone(),
+                  snaplen: crate::model::DEFAULT_SNAPLEN,
+                  buffer_size: crate::model::DEFAULT_BUFFER_SIZE,
+                  timeout_ms: crate::model::DEFAULT_TIMEOUT_MS,
+              };
+
+              let mut source = crate::capture::open_live(&live_config)?;
+              let writer = StorageWriter::spawn(db_path.to_path_buf())?;
+
+              run_source(&mut source, writer, &config, shutdown.as_ref(), false)
+          }
+          '''
+          if old not in text:
+              raise SystemExit("run_live block not found")
+          path.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt
+          cargo generate-lockfile
+          git diff --check
+      - name: Commit generated changes
+        shell: bash
+        run: |
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src/runtime.rs src/gui.rs src/bin/gui.rs Cargo.lock
+            git commit -m "wire GUI capture shutdown"
+            git push
+          fi
