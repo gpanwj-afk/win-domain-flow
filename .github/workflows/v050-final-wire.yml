@@ -1,0 +1,131 @@
+name: v050-final-wire
+
+on:
+  push:
+    branches:
+      - agent/v050-responsive-browser-diagnostics
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  wire-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/v050-responsive-browser-diagnostics
+          fetch-depth: 0
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libpcap-dev \
+            libgl1-mesa-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxrandr-dev
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Apply validated source transformations
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          def scripts_from(path):
+              workflow = Path(path).read_text()
+              marker = "python3 - <<'PY'\n"
+              scripts = []
+              cursor = 0
+              while True:
+                  start = workflow.find(marker, cursor)
+                  if start < 0:
+                      break
+                  start += len(marker)
+                  end = workflow.find("\n          PY", start)
+                  if end < 0:
+                      raise SystemExit(f"unterminated transformation in {path}")
+                  scripts.append(textwrap.dedent(workflow[start:end]))
+                  cursor = end + 1
+              return scripts
+
+          base = scripts_from(".github/workflows/v050-product-fix.yml")
+          ui = scripts_from(".github/workflows/v050-product-fix3.yml")
+          if len(base) < 3 or len(ui) < 2:
+              raise SystemExit("transformation source incomplete")
+
+          exec(compile(base[0], "browser_activity_transform", "exec"), {})
+          exec(compile(base[2], "responsive_gui_transform", "exec"), {})
+          exec(compile(ui[1], "browser_ui_transform", "exec"), {})
+
+          path = Path("src/browser_activity.rs")
+          text = path.read_text()
+          old_database = '''                                        let _ = write_json_response(
+                                              &mut stream,
+                                              500,
+                                              r#"{"ok":false,"error":"database unavailable"}"#,
+                                          );'''
+          new_database = '''                                        let _ = write_json_response(
+                                              &mut stream,
+                                              500,
+                                              r#"{"ok":false,"error":"database unavailable"}"#,
+                                              None,
+                                          );'''
+          old_invalid = '''                                    let _ = write_json_response(
+                                          &mut stream,
+                                          400,
+                                          r#"{"ok":false,"error":"invalid event"}"#,
+                                      );'''
+          new_invalid = '''                                    let _ = write_json_response(
+                                          &mut stream,
+                                          400,
+                                          r#"{"ok":false,"error":"invalid event"}"#,
+                                          None,
+                                      );'''
+          if old_database not in text or old_invalid not in text:
+              raise SystemExit("error response calls not found")
+          text = text.replace(old_database, new_database, 1)
+          text = text.replace(old_invalid, new_invalid, 1)
+          path.write_text(text)
+          PY
+
+      - name: Validate all product code
+        run: |
+          cargo fmt
+          cargo check --all-targets
+          cargo test --all-targets
+          cargo clippy --all-targets -- -D warnings
+          cargo build --release
+          node --check browser-extension/service_worker.js
+          node --check browser-extension/popup.js
+          python3 -m json.tool browser-extension/manifest.json >/dev/null
+
+      - name: Commit product changes safely
+        shell: bash
+        run: |
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock src
+          if ! git diff --cached --quiet; then
+            git commit -m "wire responsive UI and browser activity diagnostics"
+          fi
+          git fetch origin agent/v050-responsive-browser-diagnostics
+          git rebase origin/agent/v050-responsive-browser-diagnostics
+          git push origin HEAD:agent/v050-responsive-browser-diagnostics
