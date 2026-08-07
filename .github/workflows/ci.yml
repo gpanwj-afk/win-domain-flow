@@ -1,19 +1,22 @@
-name: ci
+name: master-release-diagnostic
 
 on:
-  push:
+  pull_request:
     branches:
-      - agent/v060-reliability-e2e
+      - master
 
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 jobs:
-  master-release-diagnostic:
+  diagnose:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v6
         with:
@@ -25,22 +28,22 @@ jobs:
           MERGE_SHA: 66c43af4a96857b2200af6a3f8d29eb518a382f5
         run: |
           set -euo pipefail
-          runs_json="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${MERGE_SHA}&event=push&per_page=100")"
-          latest_master_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?branch=master&event=push&per_page=10")"
-          master_ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/master")"
-          if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/v0.6.0" 2>/dev/null)"; then
+          matching_runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${MERGE_SHA}&event=push&per_page=100")"
+          recent_master_runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?branch=master&event=push&per_page=10")"
+          master_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/master")"
+          if release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/v0.6.0" 2>/dev/null)"; then
             release_exists=true
           else
             release_exists=false
-            release_json='null'
+            release='null'
           fi
           jq -n \
             --arg merge_sha "$MERGE_SHA" \
-            --argjson matching_runs "$runs_json" \
-            --argjson recent_master_runs "$latest_master_json" \
-            --argjson master_ref "$master_ref_json" \
+            --argjson matching_runs "$matching_runs" \
+            --argjson recent_master_runs "$recent_master_runs" \
+            --argjson master_ref "$master_ref" \
             --argjson release_exists "$release_exists" \
-            --argjson release "$release_json" \
+            --argjson release "$release" \
             '{queried_merge_sha:$merge_sha,matching_runs:$matching_runs,recent_master_runs:$recent_master_runs,master_ref:$master_ref,release_exists:$release_exists,release:$release}' \
             > master-release-diagnostic.json
           cat master-release-diagnostic.json
