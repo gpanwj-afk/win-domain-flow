@@ -1,4 +1,5 @@
 use crate::app_storage::TrafficPeriod;
+use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 
 const PRODUCT_DIR: &str = "win-domain-flow";
@@ -62,43 +63,66 @@ impl Default for AppSettings {
 
 impl AppSettings {
     pub fn load() -> Self {
-        let mut settings = Self::default();
-        let Ok(content) = std::fs::read_to_string(settings_path()) else {
-            return settings;
-        };
+        Self::load_with_notice().0
+    }
 
-        for line in content.lines() {
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            match key {
-                "selected_device" => {
-                    settings.selected_device = decode_hex(value).filter(|value| !value.is_empty());
-                }
-                "database_path" => {
-                    if let Some(value) = decode_hex(value) {
-                        if !value.trim().is_empty() {
-                            settings.database_path = PathBuf::from(value);
+    /// Loads persisted settings and returns a one-time startup notice when an
+    /// old working-directory database was migrated or had to be retained.
+    pub fn load_with_notice() -> (Self, Option<String>) {
+        let mut settings = Self::default();
+        let mut database_was_explicit = false;
+        let mut notice = None;
+
+        if let Ok(content) = std::fs::read_to_string(settings_path()) {
+            for line in content.lines() {
+                let Some((key, value)) = line.split_once('=') else {
+                    continue;
+                };
+                match key {
+                    "selected_device" => {
+                        settings.selected_device = decode_hex(value).filter(|value| !value.is_empty());
+                    }
+                    "database_path" => {
+                        if let Some(value) = decode_hex(value) {
+                            if !value.trim().is_empty() {
+                                settings.database_path = absolute_path(PathBuf::from(value));
+                                database_was_explicit = true;
+                            }
                         }
                     }
-                }
-                "period" => settings.period = TrafficPeriod::from_key(value),
-                "row_limit" => {
-                    if let Ok(value) = value.parse::<u32>() {
-                        settings.row_limit = value.clamp(10, 200);
+                    "period" => settings.period = TrafficPeriod::from_key(value),
+                    "row_limit" => {
+                        if let Ok(value) = value.parse::<u32>() {
+                            settings.row_limit = value.clamp(10, 200);
+                        }
                     }
-                }
-                "auto_refresh" => settings.auto_refresh = value == "true",
-                "refresh_seconds" => {
-                    if let Ok(value) = value.parse::<u64>() {
-                        settings.refresh_seconds = value.clamp(1, 30);
+                    "auto_refresh" => settings.auto_refresh = value == "true",
+                    "refresh_seconds" => {
+                        if let Ok(value) = value.parse::<u64>() {
+                            settings.refresh_seconds = value.clamp(1, 30);
+                        }
                     }
+                    "theme" => settings.theme = ThemeMode::from_key(value),
+                    _ => {}
                 }
-                "theme" => settings.theme = ThemeMode::from_key(value),
-                _ => {}
             }
         }
-        settings
+
+        if !database_was_explicit {
+            match resolve_default_database() {
+                Ok((path, migration_notice)) => {
+                    settings.database_path = path;
+                    notice = migration_notice;
+                }
+                Err(error) => {
+                    settings.database_path = default_database_path();
+                    notice = Some(format!("数据库路径初始化失败：{error}"));
+                }
+            }
+        }
+
+        settings.database_path = absolute_path(settings.database_path);
+        (settings, notice)
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -107,10 +131,13 @@ impl AppSettings {
             std::fs::create_dir_all(parent)?;
         }
 
+        // Store an absolute database path so subsequent launches cannot silently
+        // choose a different working-directory database.
+        let database_path = absolute_path(self.database_path.clone());
         let content = format!(
             "selected_device={}\ndatabase_path={}\nperiod={}\nrow_limit={}\nauto_refresh={}\nrefresh_seconds={}\ntheme={}\n",
             encode_hex(self.selected_device.as_deref().unwrap_or_default()),
-            encode_hex(&self.database_path.to_string_lossy()),
+            encode_hex(&database_path.to_string_lossy()),
             self.period.key(),
             self.row_limit,
             self.auto_refresh,
@@ -127,25 +154,15 @@ impl AppSettings {
 }
 
 pub fn product_data_dir() -> PathBuf {
-    platform_data_root()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-        .join(PRODUCT_DIR)
+    absolute_path(
+        platform_data_root()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+            .join(PRODUCT_DIR),
+    )
 }
 
 pub fn default_database_path() -> PathBuf {
-    let persistent = product_data_dir().join(DATABASE_FILE);
-    if persistent.exists() {
-        return persistent;
-    }
-
-    let legacy = std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(DATABASE_FILE);
-    if legacy.exists() {
-        legacy
-    } else {
-        persistent
-    }
+    product_data_dir().join(DATABASE_FILE)
 }
 
 pub fn settings_path() -> PathBuf {
@@ -157,6 +174,68 @@ pub fn database_parent(path: &Path) -> PathBuf {
         .filter(|parent| !parent.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(product_data_dir)
+}
+
+/// Resolves the default database without silently splitting data between the
+/// installation folder and LOCALAPPDATA. A legacy database is copied with
+/// SQLite `VACUUM INTO`, which observes committed WAL data without checkpointing
+/// or mutating the source database.
+fn resolve_default_database() -> std::io::Result<(PathBuf, Option<String>)> {
+    let persistent = default_database_path();
+    if persistent.exists() {
+        return Ok((persistent, None));
+    }
+
+    let legacy = absolute_path(
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(DATABASE_FILE),
+    );
+    if !legacy.exists() || legacy == persistent {
+        return Ok((persistent, None));
+    }
+
+    if let Some(parent) = persistent.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    match copy_sqlite_snapshot(&legacy, &persistent) {
+        Ok(()) => Ok((
+            persistent.clone(),
+            Some(format!(
+                "已将旧数据库复制到固定数据目录：{}。原文件仍保留在 {}。",
+                persistent.display(),
+                legacy.display()
+            )),
+        )),
+        Err(error) => Ok((
+            legacy.clone(),
+            Some(format!(
+                "旧数据库自动迁移失败（{error}）。本次明确继续使用旧数据库：{}。",
+                legacy.display()
+            )),
+        )),
+    }
+}
+
+fn copy_sqlite_snapshot(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let connection = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(std::io::Error::other)?;
+    let destination_text = destination.to_string_lossy().to_string();
+    connection
+        .execute("VACUUM INTO ?1", [destination_text])
+        .map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+fn absolute_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
 }
 
 fn platform_data_root() -> Option<PathBuf> {
@@ -222,6 +301,7 @@ mod tests {
         let settings = AppSettings::default();
         assert_eq!(settings.period, TrafficPeriod::MonthToDate);
         assert_eq!(settings.theme, ThemeMode::Light);
+        assert!(settings.database_path.is_absolute());
     }
 
     #[test]
