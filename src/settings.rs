@@ -367,13 +367,14 @@ mod tests {
         let source = temp_db_path("wal_source");
         let destination = temp_db_path("wal_destination");
         let connection = Connection::open(&source).unwrap();
-        connection.execute_batch(
-            "PRAGMA journal_mode=WAL;
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
              PRAGMA wal_autocheckpoint=0;
              CREATE TABLE evidence(value INTEGER NOT NULL);
              INSERT INTO evidence(value) VALUES (8192);",
-        )
-        .unwrap();
+            )
+            .unwrap();
 
         let wal_path = PathBuf::from(format!("{}-wal", source.display()));
         assert!(wal_path.exists());
