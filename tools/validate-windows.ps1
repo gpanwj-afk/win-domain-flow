@@ -18,6 +18,7 @@ $ReceiverExe = Join-Path $BinaryRoot "win-domain-flow-browser-receiver.exe"
 $ExtensionDir = Join-Path $RepoRoot "browser-extension"
 $FixtureScript = Join-Path $PSScriptRoot "browser_fixture.py"
 $QueryScript = Join-Path $PSScriptRoot "query_e2e_db.py"
+$CdpTimeoutSeconds = 15
 
 $RunId = [Guid]::NewGuid().ToString("N")
 $RunRoot = Join-Path ([IO.Path]::GetTempPath()) "win-domain-flow-e2e-$RunId"
@@ -54,6 +55,7 @@ function Add-Result {
         status = $Status
         evidence = $Evidence
     }) | Out-Null
+    Write-Host "E2E[$Status] $Name :: $Evidence"
 }
 
 function Assert-Evidence {
@@ -78,29 +80,35 @@ function Start-ToolProcess {
         [string]$WorkingDirectory,
         [switch]$RedirectOutput
     )
-    $psi = [Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName = $FilePath
-    $psi.WorkingDirectory = $WorkingDirectory
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $RedirectOutput.IsPresent
-    $hasArgumentList = $psi.PSObject.Properties.Name -contains "ArgumentList"
-    if ($hasArgumentList) {
-        foreach ($argument in $ArgumentList) { $psi.ArgumentList.Add($argument) }
+
+    # All executable/script/database/profile paths passed by this validator are
+    # absolute. Do not mutate ProcessStartInfo.WorkingDirectory: hosted Windows
+    # PowerShell adapters have proven brittle around that property, and no child
+    # process here relies on a relative working directory.
+    [System.Diagnostics.ProcessStartInfo]$startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = [string]$FilePath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $RedirectOutput.IsPresent
+    if ($startInfo.PSObject.Properties.Name -contains "ArgumentList") {
+        foreach ($argument in $ArgumentList) {
+            [void]$startInfo.ArgumentList.Add([string]$argument)
+        }
     } else {
-        $psi.Arguments = (($ArgumentList | ForEach-Object { Quote-Argument $_ }) -join " ")
+        $startInfo.Arguments = (($ArgumentList | ForEach-Object { Quote-Argument ([string]$_) }) -join " ")
     }
     if ($RedirectOutput) {
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
     }
-    $process = [Diagnostics.Process]::new()
-    $process.StartInfo = $psi
+
+    [System.Diagnostics.Process]$process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
     if (-not $process.Start()) { throw "Failed to start $FilePath" }
-    return $process
+    return ,$process
 }
 
 function Stop-ExactProcess {
-    param([Diagnostics.Process]$Process, [string]$Label)
+    param([System.Diagnostics.Process]$Process, [string]$Label)
     if ($null -eq $Process) { return }
     try { $Process.Refresh() } catch { return }
     if ($Process.HasExited) { return }
@@ -123,6 +131,15 @@ function Get-Python {
 }
 
 function Get-BrowserExecutable {
+    $explicit = [string]$env:DOMAINFLOW_BROWSER_EXECUTABLE
+    if (-not [string]::IsNullOrWhiteSpace($explicit)) {
+        $full = [IO.Path]::GetFullPath($explicit)
+        if (-not (Test-Path -LiteralPath $full)) {
+            throw "DOMAINFLOW_BROWSER_EXECUTABLE does not exist: $full"
+        }
+        return $full
+    }
+
     $candidates = @(@(
         "$env:ProgramFiles(x86)\Microsoft\Edge\Application\msedge.exe",
         "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
@@ -149,10 +166,22 @@ function Wait-FileLines {
     throw "Timed out waiting for $Path"
 }
 
+function New-CdpCancellationTokenSource {
+    return ,[System.Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($CdpTimeoutSeconds))
+}
+
 function Connect-Cdp {
     param([string]$Uri)
     $socket = [Net.WebSockets.ClientWebSocket]::new()
-    [void]$socket.ConnectAsync([Uri]$Uri, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+    $cts = New-CdpCancellationTokenSource
+    try {
+        [void]$socket.ConnectAsync([Uri]$Uri, $cts.Token).GetAwaiter().GetResult()
+    } catch {
+        $socket.Dispose()
+        throw "Timed out or failed connecting to CDP $Uri after ${CdpTimeoutSeconds}s: $($_.Exception.Message)"
+    } finally {
+        $cts.Dispose()
+    }
     return ,$socket
 }
 
@@ -163,7 +192,14 @@ function Receive-CdpMessage {
     try {
         do {
             $segment = [ArraySegment[byte]]::new($buffer)
-            $result = $Socket.ReceiveAsync($segment, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+            $cts = New-CdpCancellationTokenSource
+            try {
+                $result = $Socket.ReceiveAsync($segment, $cts.Token).GetAwaiter().GetResult()
+            } catch {
+                throw "Timed out or failed receiving a CDP message after ${CdpTimeoutSeconds}s: $($_.Exception.Message)"
+            } finally {
+                $cts.Dispose()
+            }
             if ($result.MessageType -eq [Net.WebSockets.WebSocketMessageType]::Close) {
                 throw "CDP WebSocket closed unexpectedly"
             }
@@ -188,12 +224,19 @@ function Send-Cdp {
     if (-not [string]::IsNullOrWhiteSpace($SessionId)) { $payload.sessionId = $SessionId }
     $json = $payload | ConvertTo-Json -Depth 50 -Compress
     $bytes = [Text.Encoding]::UTF8.GetBytes($json)
-    [void]$Socket.SendAsync(
-        [ArraySegment[byte]]::new($bytes),
-        [Net.WebSockets.WebSocketMessageType]::Text,
-        $true,
-        [Threading.CancellationToken]::None
-    ).GetAwaiter().GetResult()
+    $cts = New-CdpCancellationTokenSource
+    try {
+        [void]$Socket.SendAsync(
+            [ArraySegment[byte]]::new($bytes),
+            [Net.WebSockets.WebSocketMessageType]::Text,
+            $true,
+            $cts.Token
+        ).GetAwaiter().GetResult()
+    } catch {
+        throw "Timed out or failed sending CDP $Method after ${CdpTimeoutSeconds}s: $($_.Exception.Message)"
+    } finally {
+        $cts.Dispose()
+    }
 
     while ($true) {
         $message = Receive-CdpMessage $Socket
