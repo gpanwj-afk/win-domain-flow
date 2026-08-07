@@ -1,0 +1,121 @@
+name: v060-receiver-helper-wire
+
+on:
+  push:
+    branches:
+      - agent/v060-reliability-e2e
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/v060-reliability-e2e
+          fetch-depth: 0
+      - name: Wire helper executable into validator and CI
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          validator = Path("tools/validate-windows.ps1")
+          text = validator.read_text()
+          old = '$Cli = Join-Path $BinaryRoot "win-domain-flow.exe"\n$ExtensionDir'
+          new = '$Cli = Join-Path $BinaryRoot "win-domain-flow.exe"\n$ReceiverExe = Join-Path $BinaryRoot "win-domain-flow-browser-receiver.exe"\n$ExtensionDir'
+          if old not in text:
+              raise SystemExit("validator receiver variable marker not found")
+          text = text.replace(old, new, 1)
+
+          old = '    cli_path = $Cli\n    database_path = $TestDb'
+          new = '    cli_path = $Cli\n    receiver_executable = $ReceiverExe\n    receiver_binary_sha256 = $null\n    database_path = $TestDb'
+          if old not in text:
+              raise SystemExit("validator manifest marker not found")
+          text = text.replace(old, new, 1)
+
+          old = '    Assert-Evidence (Test-Path $Cli) "CLI executable exists" $Cli\n    Assert-Evidence (Test-Path (Join-Path $ExtensionDir "manifest.json"))'
+          new = '    Assert-Evidence (Test-Path $Cli) "CLI executable exists" $Cli\n    Assert-Evidence (Test-Path $ReceiverExe) "Npcap-independent Receiver executable exists" $ReceiverExe\n    Assert-Evidence (Test-Path (Join-Path $ExtensionDir "manifest.json"))'
+          if old not in text:
+              raise SystemExit("validator receiver assertion marker not found")
+          text = text.replace(old, new, 1)
+
+          old = '    $Manifest.binary_sha256 = (Get-FileHash -LiteralPath $Cli -Algorithm SHA256).Hash.ToLowerInvariant()'
+          new = old + '\n    $Manifest.receiver_binary_sha256 = (Get-FileHash -LiteralPath $ReceiverExe -Algorithm SHA256).Hash.ToLowerInvariant()'
+          if old not in text:
+              raise SystemExit("validator hash marker not found")
+          text = text.replace(old, new, 1)
+
+          text = text.replace(
+              '$ReceiverProcess = Start-ToolProcess $Cli @("browser-receiver", "--db", $TestDb, "--port", "0") $RepoRoot -RedirectOutput',
+              '$ReceiverProcess = Start-ToolProcess $ReceiverExe @("--db", $TestDb, "--port", "0") $RepoRoot -RedirectOutput',
+              1,
+          )
+          text = text.replace(
+              '$ReceiverProcess = Start-ToolProcess $Cli @("browser-receiver", "--db", $TestDb, "--port", "$ReceiverPort") $RepoRoot -RedirectOutput',
+              '$ReceiverProcess = Start-ToolProcess $ReceiverExe @("--db", $TestDb, "--port", "$ReceiverPort") $RepoRoot -RedirectOutput',
+              1,
+          )
+          if 'Start-ToolProcess $Cli @("browser-receiver"' in text:
+              raise SystemExit("validator still uses main CLI for receiver")
+          validator.write_text(text)
+
+          ci = Path(".github/workflows/ci.yml")
+          text = ci.read_text()
+          text = text.replace(
+              '          assert "reportChain" in worker\n          assert "redirectResponse" in worker',
+              '          assert "reportChain" in worker\n          assert "revision" in worker\n          assert "redirectResponse" in worker',
+              1,
+          )
+          text = text.replace(
+              '          test -f target/release/win-domain-flow-gui\n',
+              '          test -f target/release/win-domain-flow-gui\n          test -f target/release/win-domain-flow-browser-receiver\n',
+              1,
+          )
+          text = text.replace(
+              '          if (!(Test-Path "$root\\win-domain-flow-gui.exe")) { throw "GUI executable missing" }\n',
+              '          if (!(Test-Path "$root\\win-domain-flow-gui.exe")) { throw "GUI executable missing" }\n          if (!(Test-Path "$root\\win-domain-flow-browser-receiver.exe")) { throw "Receiver helper executable missing" }\n',
+              1,
+          )
+          text = text.replace(
+              '          Copy-Item "$source\\win-domain-flow-gui.exe" $package\n',
+              '          Copy-Item "$source\\win-domain-flow-gui.exe" $package\n          Copy-Item "$source\\win-domain-flow-browser-receiver.exe" $package\n',
+              1,
+          )
+          text = text.replace(
+              '            "$package\\win-domain-flow-gui.exe",\n',
+              '            "$package\\win-domain-flow-gui.exe",\n            "$package\\win-domain-flow-browser-receiver.exe",\n',
+              1,
+          )
+          ci.write_text(text)
+          PY
+      - name: Parse validator
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path tools/validate-windows.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host $_.Message }
+            throw "PowerShell syntax errors found"
+          }
+      - name: Commit helper wiring
+        shell: bash
+        run: |
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tools/validate-windows.ps1 .github/workflows/ci.yml
+          git commit -m "use Npcap-independent receiver for Windows E2E"
+          git pull --rebase origin agent/v060-reliability-e2e
+          git push origin HEAD:agent/v060-reliability-e2e
