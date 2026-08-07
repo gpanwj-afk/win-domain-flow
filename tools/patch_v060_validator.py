@@ -2,6 +2,7 @@ from pathlib import Path
 
 path = Path("tools/validate-windows.ps1")
 text = path.read_text()
+text = text.replace('throw "$Name: $Evidence"', 'throw "${Name}: $Evidence"', 1)
 start = text.index("    $beforeRestartCount = [int]$DatabaseEvidence.request_count")
 end = text.index("    $statusAfterRestart = Invoke-RestMethod", start)
 replacement = r'''    $beforeRestartCount = [int]$DatabaseEvidence.request_count
