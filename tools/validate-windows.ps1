@@ -507,10 +507,12 @@ try {
     $runtimeProbe = Evaluate-Cdp $BrowserSocket $ServiceSession "({hasChrome:typeof chrome==='object',hasRuntime:typeof chrome==='object' && !!chrome.runtime && !!chrome.runtime.sendMessage,hasStorage:typeof chrome==='object' && !!chrome.storage && !!chrome.storage.local})"
     Assert-Evidence ([bool]$runtimeProbe.hasChrome -and [bool]$runtimeProbe.hasRuntime -and [bool]$runtimeProbe.hasStorage) "Extension popup Runtime context" ($runtimeProbe | ConvertTo-Json -Compress)
     $previous = Evaluate-Cdp $BrowserSocket $ServiceSession "chrome.runtime.sendMessage({type:'diagnostics-health'})"
-    Assert-Evidence ([bool]$previous.ok) "Extension popup Receiver health" ($previous | ConvertTo-Json -Compress)
     $PreviousDiagnosticsEnabled = [bool]$previous.enabled
+    Add-Result "Extension previous diagnostics state" "PASS" "enabled=$($previous.enabled); receiverPort=$($previous.receiverPort)"
     $portResponse = Evaluate-Cdp $BrowserSocket $ServiceSession "chrome.runtime.sendMessage({type:'diagnostics-set-receiver-port',port:$ReceiverPort})"
     Assert-Evidence ([bool]$portResponse.ok -and [int]$portResponse.receiverPort -eq $ReceiverPort) "Extension Receiver port configured" ($portResponse | ConvertTo-Json -Compress)
+    $configuredHealth = Evaluate-Cdp $BrowserSocket $ServiceSession "chrome.runtime.sendMessage({type:'diagnostics-health'})"
+    Assert-Evidence ([bool]$configuredHealth.ok -and [int]$configuredHealth.receiverPort -eq $ReceiverPort) "Extension popup Receiver health" ($configuredHealth | ConvertTo-Json -Compress)
     $enableResponse = Evaluate-Cdp $BrowserSocket $ServiceSession "chrome.runtime.sendMessage({type:'diagnostics-set-enabled',enabled:true})"
     Assert-Evidence ([bool]$enableResponse.ok -and [bool]$enableResponse.enabled) "Extension diagnostics enabled" ($enableResponse | ConvertTo-Json -Compress)
 
