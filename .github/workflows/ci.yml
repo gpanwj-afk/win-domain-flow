@@ -12,6 +12,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   linux-quality:
     runs-on: ubuntu-latest
@@ -270,16 +274,39 @@ jobs:
           "DOMAINFLOW_CFT_VERSION=$($stable.version)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Isolated Chrome for Testing browser diagnostics E2E
+        timeout-minutes: 6
         shell: pwsh
         run: |
           if ([string]::IsNullOrWhiteSpace($env:DOMAINFLOW_CFT_PROGRAM_FILES)) {
             throw "Chrome for Testing staging path is missing"
           }
-          # Chrome 137+ intentionally removed --load-extension from branded
-          # release Chrome. Chrome for Testing is the supported automation
-          # surface; expose its isolated staging root only to this validator.
           $env:ProgramFiles = $env:DOMAINFLOW_CFT_PROGRAM_FILES
           Write-Host "Using Chrome for Testing $env:DOMAINFLOW_CFT_VERSION"
+
+          # Temporary diagnostic instrumentation. This changes only the runner's
+          # workspace copy; the checked-in validator remains the release source.
+          $validator = "tools\validate-windows.ps1"
+          $text = Get-Content -LiteralPath $validator -Raw
+          $old = @'
+              $Results.Add([pscustomobject]@{
+                  name = $Name
+                  status = $Status
+                  evidence = $Evidence
+              }) | Out-Null
+          }
+          '@
+          $new = @'
+              $Results.Add([pscustomobject]@{
+                  name = $Name
+                  status = $Status
+                  evidence = $Evidence
+              }) | Out-Null
+              Write-Host "E2E[$Status] $Name :: $Evidence"
+          }
+          '@
+          if (-not $text.Contains($old)) { throw "E2E milestone instrumentation point missing" }
+          Set-Content -LiteralPath $validator -Value $text.Replace($old, $new) -Encoding UTF8
+
           $report = Join-Path $env:RUNNER_TEMP "domainflow-browser-e2e"
           .\tools\validate-windows.ps1 `
             -BinaryRoot ".\target\x86_64-pc-windows-msvc\release" `
