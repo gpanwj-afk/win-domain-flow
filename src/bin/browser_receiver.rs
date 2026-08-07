@@ -4,14 +4,14 @@
 //! modules and does not link the packet-capture stack. That lets Windows E2E
 //! validate Receiver behavior without requiring the Npcap runtime DLL.
 
-#[path = "../model.rs"]
-mod model;
-#[path = "../storage.rs"]
-mod storage;
 #[path = "../app_storage.rs"]
 mod app_storage;
 #[path = "../browser_activity.rs"]
 mod browser_activity;
+#[path = "../model.rs"]
+mod model;
+#[path = "../storage.rs"]
+mod storage;
 
 use browser_activity::BrowserActivityServer;
 use std::path::PathBuf;
