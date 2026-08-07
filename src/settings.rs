@@ -72,7 +72,6 @@ impl AppSettings {
     pub fn load_with_notice() -> (Self, Option<String>) {
         let mut settings = Self::default();
         let mut database_was_explicit = false;
-        let mut notice = None;
 
         if let Ok(content) = std::fs::read_to_string(settings_path()) {
             for line in content.lines() {
@@ -115,18 +114,18 @@ impl AppSettings {
         } else {
             resolve_default_database()
         };
-        match resolved {
+        let notice = match resolved {
             Ok((path, migration_notice)) => {
                 settings.database_path = path;
-                notice = migration_notice;
+                migration_notice
             }
             Err(error) => {
                 if !database_was_explicit {
                     settings.database_path = default_database_path();
                 }
-                notice = Some(format!("数据库路径初始化失败：{error}"));
+                Some(format!("数据库路径初始化失败：{error}"))
             }
-        }
+        };
 
         settings.database_path = absolute_path(settings.database_path);
         (settings, notice)
@@ -208,11 +207,15 @@ fn resolve_persisted_database(path: &Path) -> std::io::Result<(PathBuf, Option<S
     let path = absolute_path(path.to_path_buf());
     let persistent = default_database_path();
     let legacy = legacy_working_directory_database_path();
-    if path == legacy && legacy != persistent && legacy.exists() && !persistent.exists() {
+    if should_migrate_persisted_database(&path, &legacy, &persistent) {
         resolve_legacy_database(&legacy, &persistent)
     } else {
         Ok((path, None))
     }
+}
+
+fn should_migrate_persisted_database(path: &Path, legacy: &Path, persistent: &Path) -> bool {
+    path == legacy && legacy != persistent && legacy.exists() && !persistent.exists()
 }
 
 fn resolve_legacy_database(
@@ -427,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_resolver_migrates_old_default_but_preserves_custom_paths() {
+    fn persisted_legacy_default_is_migrated_but_custom_path_is_not() {
         let legacy = temp_db_path("legacy_default");
         let persistent = temp_db_path("persistent_default");
         let custom = temp_db_path("custom");
@@ -436,6 +439,17 @@ mod tests {
             .execute_batch("CREATE TABLE evidence(value INTEGER); INSERT INTO evidence VALUES (7);")
             .unwrap();
         drop(connection);
+
+        assert!(should_migrate_persisted_database(
+            &legacy,
+            &legacy,
+            &persistent
+        ));
+        assert!(!should_migrate_persisted_database(
+            &custom,
+            &legacy,
+            &persistent
+        ));
 
         let (resolved, notice) = resolve_legacy_database(&legacy, &persistent).unwrap();
         assert_eq!(resolved, persistent);
@@ -447,13 +461,11 @@ mod tests {
         assert_eq!(value, 7);
         drop(copied);
 
-        let (custom_resolved, custom_notice) = if custom == legacy {
-            unreachable!()
-        } else {
-            (custom.clone(), None::<String>)
-        };
-        assert_eq!(custom_resolved, custom);
-        assert!(custom_notice.is_none());
+        assert!(!should_migrate_persisted_database(
+            &legacy,
+            &legacy,
+            &persistent
+        ));
 
         cleanup_database(&legacy);
         cleanup_database(&persistent);
