@@ -48,7 +48,7 @@ jobs:
           git diff --check
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.lock src/browser_activity.rs src/browser_ui.rs src/gui.rs src/cli.rs
+          git add Cargo.lock src
           if ! git diff --cached --quiet; then
             git commit -m "harden browser receiver and isolated validation"
             git pull --rebase origin agent/v060-reliability-e2e
