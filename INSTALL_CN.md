@@ -118,7 +118,7 @@ http://127.0.0.1:38765/status
 
 `/status` 可核对 Receiver PID、数据库绝对路径、事件计数和最近错误。
 
-浏览器事件写入 `/events` 时必须来自 0.6 发行扩展的精确 Origin。缺失 Origin、其他扩展 ID和普通网页来源会被拒绝。
+浏览器事件写入 `/events` 时必须来自 0.6 发行扩展的精确 Origin。缺失 Origin、其他扩展 ID 和普通网页来源会被拒绝。
 
 ## 七、Receiver 暂时不可用时
 
@@ -126,7 +126,7 @@ http://127.0.0.1:38765/status
 
 0.6 使用：
 
-- 持久化有界队列，按事件条数和本地存储容量双重限制
+- 持久化有界队列，最多 1000 条，同时将序列化队列控制在约 4 MiB 以内
 - JSON ACK
 - 指数退避
 - `chrome.alarms` 自动恢复补发
@@ -236,7 +236,8 @@ tools\query_e2e_db.py
 - 使用动态 Receiver 端口
 - 使用独立临时 SQLite
 - 启动仅监听 `127.0.0.1` 的 fixture
-- 动态发现扩展 Service Worker 与实际 ID
+- 动态发现扩展 Service Worker 与实际 ID，并与 Receiver 期望的发行 ID 严格核对
+- CDP connect/send/receive 使用硬超时，浏览器异常不会无限挂住
 - 用 `/status` 核对 Receiver PID 与数据库路径
 - 验证 request、实际传输字节和 download 记录
 - 故意停止 Receiver，在停机期间产生真实浏览器事件
@@ -253,7 +254,7 @@ validation-report.xml
 validation-manifest.json
 ```
 
-manifest 记录 commit、二进制 SHA-256、Receiver PID/端口、浏览器 PID、Profile、扩展 ID和测试数据库路径。
+manifest 记录 commit、二进制 SHA-256、Receiver PID/端口、浏览器 PID、Profile、扩展 ID 和测试数据库路径。
 
 ## 十二、常见问题
 
