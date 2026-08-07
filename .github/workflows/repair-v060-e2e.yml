@@ -8,6 +8,7 @@ on:
 permissions:
   contents: write
 
+# Temporary release-repair workflow. It will be deleted before PR #7 is merged.
 jobs:
   repair:
     runs-on: ubuntu-latest
