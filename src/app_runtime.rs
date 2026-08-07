@@ -10,7 +10,7 @@ use crate::model::{
 };
 use crate::packet::parse_packet;
 use crate::runtime::RuntimeConfig;
-use crate::storage::{Storage, StorageError};
+use crate::storage::StorageError;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
@@ -295,14 +295,6 @@ impl ProductStorageWriter {
         let handle = std::thread::Builder::new()
             .name("domainflow-product-db-writer".to_string())
             .spawn(move || {
-                let mut domain_storage = match Storage::open(&path) {
-                    Ok(storage) => storage,
-                    Err(error) => {
-                        let message = error.to_string();
-                        let _ = ready_tx.send(Err(message.clone()));
-                        return Err(ApplicationRuntimeError::WriterFailed(message));
-                    }
-                };
                 let mut application_storage = match ApplicationStorage::open(&path) {
                     Ok(storage) => storage,
                     Err(error) => {
@@ -316,15 +308,9 @@ impl ProductStorageWriter {
                 loop {
                     match command_rx.recv() {
                         Ok(WriterCommand::Write(domain_batch, application_batch)) => {
-                            let result = domain_storage
-                                .upsert_batch(&domain_batch)
-                                .map_err(ApplicationRuntimeError::Storage)
-                                .and_then(|()| {
-                                    application_storage
-                                        .upsert_batch(&application_batch)
-                                        .map_err(ApplicationRuntimeError::ApplicationStorage)
-                                });
-                            if let Err(error) = result {
+                            if let Err(error) = application_storage
+                                .upsert_product_batches(&domain_batch, &application_batch)
+                            {
                                 let message = error.to_string();
                                 let _ = error_tx.send(message.clone());
                                 return Err(ApplicationRuntimeError::WriterFailed(message));

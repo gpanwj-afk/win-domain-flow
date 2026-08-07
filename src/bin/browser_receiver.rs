@@ -60,7 +60,8 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let database = database.ok_or_else(|| anyhow::anyhow!("--db is required"))?;
+    let database =
+        absolute_database_path(database.ok_or_else(|| anyhow::anyhow!("--db is required"))?)?;
     let server = BrowserActivityServer::spawn_on(database, port)?;
     let status = server.status();
     println!(
@@ -79,4 +80,12 @@ fn main() -> anyhow::Result<()> {
     }
     server.shutdown()?;
     Ok(())
+}
+
+fn absolute_database_path(path: PathBuf) -> anyhow::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
 }
