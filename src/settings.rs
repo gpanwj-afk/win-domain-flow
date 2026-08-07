@@ -110,16 +110,21 @@ impl AppSettings {
             }
         }
 
-        if !database_was_explicit {
-            match resolve_default_database() {
-                Ok((path, migration_notice)) => {
-                    settings.database_path = path;
-                    notice = migration_notice;
-                }
-                Err(error) => {
+        let resolved = if database_was_explicit {
+            resolve_persisted_database(&settings.database_path)
+        } else {
+            resolve_default_database()
+        };
+        match resolved {
+            Ok((path, migration_notice)) => {
+                settings.database_path = path;
+                notice = migration_notice;
+            }
+            Err(error) => {
+                if !database_was_explicit {
                     settings.database_path = default_database_path();
-                    notice = Some(format!("数据库路径初始化失败：{error}"));
                 }
+                notice = Some(format!("数据库路径初始化失败：{error}"));
             }
         }
 
@@ -178,32 +183,56 @@ pub fn database_parent(path: &Path) -> PathBuf {
         .unwrap_or_else(product_data_dir)
 }
 
+fn legacy_working_directory_database_path() -> PathBuf {
+    absolute_path(
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(DATABASE_FILE),
+    )
+}
+
 /// Resolves the default database without silently splitting data between the
 /// installation folder and LOCALAPPDATA. A legacy database is copied through
 /// SQLite's online backup API so committed WAL pages are included without
 /// checkpointing or mutating the source database.
 fn resolve_default_database() -> std::io::Result<(PathBuf, Option<String>)> {
     let persistent = default_database_path();
-    if persistent.exists() {
-        return Ok((persistent, None));
-    }
+    let legacy = legacy_working_directory_database_path();
+    resolve_legacy_database(&legacy, &persistent)
+}
 
-    let legacy = absolute_path(
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(DATABASE_FILE),
-    );
+/// Older releases persisted their automatically selected working-directory
+/// database in settings.conf. Treat that exact legacy default as migratable,
+/// while preserving any genuinely custom persisted path.
+fn resolve_persisted_database(path: &Path) -> std::io::Result<(PathBuf, Option<String>)> {
+    let path = absolute_path(path.to_path_buf());
+    let persistent = default_database_path();
+    let legacy = legacy_working_directory_database_path();
+    if path == legacy && legacy != persistent && legacy.exists() && !persistent.exists() {
+        resolve_legacy_database(&legacy, &persistent)
+    } else {
+        Ok((path, None))
+    }
+}
+
+fn resolve_legacy_database(
+    legacy: &Path,
+    persistent: &Path,
+) -> std::io::Result<(PathBuf, Option<String>)> {
+    if persistent.exists() {
+        return Ok((persistent.to_path_buf(), None));
+    }
     if !legacy.exists() || legacy == persistent {
-        return Ok((persistent, None));
+        return Ok((persistent.to_path_buf(), None));
     }
 
     if let Some(parent) = persistent.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    match copy_sqlite_snapshot(&legacy, &persistent) {
+    match copy_sqlite_snapshot(legacy, persistent) {
         Ok(()) => Ok((
-            persistent.clone(),
+            persistent.to_path_buf(),
             Some(format!(
                 "已将旧数据库复制到固定数据目录：{}。原文件仍保留在 {}。",
                 persistent.display(),
@@ -211,7 +240,7 @@ fn resolve_default_database() -> std::io::Result<(PathBuf, Option<String>)> {
             )),
         )),
         Err(error) => Ok((
-            legacy.clone(),
+            legacy.to_path_buf(),
             Some(format!(
                 "旧数据库自动迁移失败（{error}）。本次明确继续使用旧数据库：{}。",
                 legacy.display()
@@ -395,5 +424,39 @@ mod tests {
         drop(connection);
         cleanup_database(&source);
         cleanup_database(&destination);
+    }
+
+    #[test]
+    fn legacy_resolver_migrates_old_default_but_preserves_custom_paths() {
+        let legacy = temp_db_path("legacy_default");
+        let persistent = temp_db_path("persistent_default");
+        let custom = temp_db_path("custom");
+        let connection = Connection::open(&legacy).unwrap();
+        connection
+            .execute_batch("CREATE TABLE evidence(value INTEGER); INSERT INTO evidence VALUES (7);")
+            .unwrap();
+        drop(connection);
+
+        let (resolved, notice) = resolve_legacy_database(&legacy, &persistent).unwrap();
+        assert_eq!(resolved, persistent);
+        assert!(notice.is_some());
+        let copied = Connection::open(&resolved).unwrap();
+        let value: i64 = copied
+            .query_row("SELECT value FROM evidence", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 7);
+        drop(copied);
+
+        let (custom_resolved, custom_notice) = if custom == legacy {
+            unreachable!()
+        } else {
+            (custom.clone(), None::<String>)
+        };
+        assert_eq!(custom_resolved, custom);
+        assert!(custom_notice.is_none());
+
+        cleanup_database(&legacy);
+        cleanup_database(&persistent);
+        cleanup_database(&custom);
     }
 }
