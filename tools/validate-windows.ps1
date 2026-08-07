@@ -34,6 +34,7 @@ New-Item -ItemType Directory -Path $RunRoot, $ProfileDir, $DownloadDir, $OutputD
 $Results = [Collections.Generic.List[object]]::new()
 $OwnedTargets = [Collections.Generic.List[string]]::new()
 $BrowserSocket = $null
+$ExtensionSocket = $null
 $ServiceSession = $null
 $PreviousDiagnosticsEnabled = $false
 $FixtureProcess = $null
@@ -300,6 +301,22 @@ function Find-ExtensionTarget {
     return $null
 }
 
+function Find-CdpTargetDebuggerUrl {
+    param([int]$Port, [string]$TargetId, [int]$TimeoutSeconds)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        foreach ($path in @("/json/list", "/json")) {
+            try {
+                $targets = @(Invoke-RestMethod -Uri "http://127.0.0.1:$Port$path" -TimeoutSec 3)
+                $match = @($targets | Where-Object { ([string]$_.id -eq $TargetId -or [string]$_.targetId -eq $TargetId) -and -not [string]::IsNullOrWhiteSpace([string]$_.webSocketDebuggerUrl) })
+                if ($match.Count -gt 0) { return [string]$match[0].webSocketDebuggerUrl }
+            } catch { }
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    return $null
+}
+
 function Get-OwnedBrowserProcesses {
     param([string]$Profile, [string]$ProcessName)
     return @(
@@ -476,12 +493,16 @@ try {
     Assert-Evidence (-not [string]::IsNullOrWhiteSpace($ExtensionId)) "Dynamic extension discovery" $ExtensionId
     Assert-Evidence ($ExtensionId -eq [string]$ReceiverStatus.expected_extension_id) "Extension identity matches Receiver policy" $ExtensionId
 
-    $attach = Send-Cdp $BrowserSocket "Target.attachToTarget" @{ targetId = $extensionTarget.target.targetId; flatten = $true }
-    $ServiceSession = [string]$attach.sessionId
-    $previous = Evaluate-Cdp $BrowserSocket $ServiceSession "new Promise(resolve => chrome.storage.local.get({diagnosticsEnabled:false, receiverPort:38765}).then(resolve))"
+    $serviceDebuggerUrl = Find-CdpTargetDebuggerUrl $BrowserDebugPort ([string]$extensionTarget.target.targetId) 15
+    Assert-Evidence (-not [string]::IsNullOrWhiteSpace($serviceDebuggerUrl)) "Extension Service Worker debugger URL" ([string]$extensionTarget.target.targetId)
+    $ExtensionSocket = Connect-Cdp $serviceDebuggerUrl
+    [void](Send-Cdp $ExtensionSocket "Runtime.enable" @{})
+    $runtimeProbe = Evaluate-Cdp $ExtensionSocket "" "({hasChrome:typeof chrome==='object',hasStorage:typeof chrome==='object' && !!chrome.storage && !!chrome.storage.local})"
+    Assert-Evidence ([bool]$runtimeProbe.hasChrome -and [bool]$runtimeProbe.hasStorage) "Extension Runtime context" ($runtimeProbe | ConvertTo-Json -Compress)
+    $previous = Evaluate-Cdp $ExtensionSocket "" "new Promise(resolve => chrome.storage.local.get({diagnosticsEnabled:false, receiverPort:38765}).then(resolve))"
     $PreviousDiagnosticsEnabled = [bool]$previous.diagnosticsEnabled
     $setExpression = "new Promise((resolve,reject)=>chrome.storage.local.set({diagnosticsEnabled:true,receiverPort:$ReceiverPort}).then(()=>resolve(true)).catch(e=>reject(String(e))))"
-    [void](Evaluate-Cdp $BrowserSocket $ServiceSession $setExpression)
+    [void](Evaluate-Cdp $ExtensionSocket "" $setExpression)
     Add-Result "Extension diagnostics enabled" "PASS" "receiverPort=$ReceiverPort"
 
     [void](Send-Cdp $BrowserSocket "Browser.setDownloadBehavior" @{ behavior = "allow"; downloadPath = $DownloadDir; eventsEnabled = $true })
@@ -513,7 +534,7 @@ try {
     Assert-Evidence $havePositive "Actual transferred bytes persisted" "positive_transferred_count=$($DatabaseEvidence.positive_transferred_count)"
     Assert-Evidence $haveDownload "Browser download persisted" "download_count=$($DatabaseEvidence.download_count)"
 
-    $extensionHealth = Evaluate-Cdp $BrowserSocket $ServiceSession "({enabled:diagnosticsEnabled,attachedTabs:attachedTabs.size,queueLength:eventQueue.length,lastAttachError,lastReceiverError})"
+    $extensionHealth = Evaluate-Cdp $ExtensionSocket "" "({enabled:diagnosticsEnabled,attachedTabs:attachedTabs.size,queueLength:eventQueue.length,lastAttachError,lastReceiverError})"
     Assert-Evidence ([bool]$extensionHealth.enabled) "Extension runtime enabled" ($extensionHealth | ConvertTo-Json -Compress)
     Assert-Evidence ([int]$extensionHealth.attachedTabs -gt 0) "At least one browser tab attached" "attachedTabs=$($extensionHealth.attachedTabs)"
     Assert-Evidence ([string]::IsNullOrWhiteSpace([string]$extensionHealth.lastReceiverError)) "Extension Receiver delivery healthy" "queueLength=$($extensionHealth.queueLength)"
@@ -536,7 +557,7 @@ try {
     $receiverErrorDuringOutage = $false
     do {
         Start-Sleep -Milliseconds 400
-        $outageHealth = Evaluate-Cdp $BrowserSocket $ServiceSession "({queueLength:eventQueue.length,lastReceiverError})"
+        $outageHealth = Evaluate-Cdp $ExtensionSocket "" "({queueLength:eventQueue.length,lastReceiverError})"
         $queuedDuringOutage = [int]$outageHealth.queueLength -gt 0
         $receiverErrorDuringOutage = -not [string]::IsNullOrWhiteSpace([string]$outageHealth.lastReceiverError)
     } while ((-not ($queuedDuringOutage -and $receiverErrorDuringOutage)) -and [DateTime]::UtcNow -lt $deadline)
@@ -565,7 +586,7 @@ try {
     $outageEventsPersisted = $false
     do {
         Start-Sleep -Milliseconds 500
-        $recoveryHealth = Evaluate-Cdp $BrowserSocket $ServiceSession "({queueLength:eventQueue.length,lastReceiverError})"
+        $recoveryHealth = Evaluate-Cdp $ExtensionSocket "" "({queueLength:eventQueue.length,lastReceiverError})"
         $DatabaseEvidence = Query-TestDatabase $Python $TestDb
         $queueRecovered = [int]$recoveryHealth.queueLength -eq 0 -and [string]::IsNullOrWhiteSpace([string]$recoveryHealth.lastReceiverError)
         $outageEventsPersisted = [int]$DatabaseEvidence.request_count -gt $beforeRestartCount
@@ -596,10 +617,10 @@ try {
     }
 } finally {
     # Restore the diagnostics flag in the dedicated profile before teardown.
-    if ($null -ne $BrowserSocket -and -not [string]::IsNullOrWhiteSpace($ServiceSession)) {
+    if ($null -ne $ExtensionSocket) {
         try {
             $restoreValue = if ($PreviousDiagnosticsEnabled) { "true" } else { "false" }
-            [void](Evaluate-Cdp $BrowserSocket $ServiceSession "chrome.storage.local.set({diagnosticsEnabled:$restoreValue}).then(()=>true)")
+            [void](Evaluate-Cdp $ExtensionSocket "" "chrome.storage.local.set({diagnosticsEnabled:$restoreValue}).then(()=>true)")
             Add-Result "Extension diagnostics setting restored" "PASS" "diagnosticsEnabled=$restoreValue"
         } catch {
             Add-Result "Extension diagnostics setting restored" "FAIL" $_.Exception.Message
