@@ -82,6 +82,7 @@ jobs:
 
           assert "pendingEventQueue" in worker
           assert "RETRY_BASE_MS" in worker and "RETRY_MAX_MS" in worker
+          assert "MAX_QUEUE_BYTES" in worker
           assert "response.json()" in worker
           assert "accepted !== true" in worker
           assert "reportChain" in worker
@@ -118,7 +119,7 @@ jobs:
 
   windows-product:
     runs-on: windows-latest
-    timeout-minutes: 70
+    timeout-minutes: 80
 
     steps:
       - name: Checkout
@@ -212,9 +213,73 @@ jobs:
             throw "PowerShell validation harness contains syntax errors"
           }
 
-      - name: Isolated Edge/Chrome browser diagnostics E2E
+      - name: Install Chrome for Testing
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          $metadataUrl = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
+          $metadata = Invoke-RestMethod -Uri $metadataUrl -TimeoutSec 30
+          $stable = $metadata.channels.Stable
+          $download = @($stable.downloads.chrome | Where-Object { $_.platform -eq "win64" })[0]
+          if (-not $download -or -not $download.url) {
+            throw "Chrome for Testing win64 Stable download was not present in official metadata"
+          }
+
+          $archive = Join-Path $env:RUNNER_TEMP "chrome-for-testing.zip"
+          $extractRoot = Join-Path $env:RUNNER_TEMP "chrome-for-testing"
+          $fakeProgramFiles = Join-Path $env:RUNNER_TEMP "domainflow-cft-program-files"
+          $targetDir = Join-Path $fakeProgramFiles "Google\Chrome\Application"
+          Remove-Item $archive, $extractRoot, $fakeProgramFiles -Recurse -Force -ErrorAction SilentlyContinue
+
+          $downloaded = $false
+          for ($attempt = 1; $attempt -le 4; $attempt++) {
+            Write-Host "Downloading Chrome for Testing $($stable.version), attempt $attempt of 4"
+            Remove-Item $archive -Force -ErrorAction SilentlyContinue
+            & curl.exe `
+              --fail `
+              --location `
+              --retry 5 `
+              --retry-all-errors `
+              --retry-delay 3 `
+              --connect-timeout 20 `
+              --max-time 300 `
+              --output $archive `
+              $download.url
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $archive)) {
+              $size = (Get-Item $archive).Length
+              if ($size -gt 10000000) {
+                $downloaded = $true
+                break
+              }
+              Write-Warning "Chrome for Testing archive was unexpectedly small: $size bytes"
+            }
+            Start-Sleep -Seconds (5 * $attempt)
+          }
+          if (-not $downloaded) { throw "Failed to download Chrome for Testing" }
+
+          Expand-Archive -Path $archive -DestinationPath $extractRoot -Force
+          $chrome = Get-ChildItem $extractRoot -Recurse -Filter chrome.exe | Select-Object -First 1
+          if (-not $chrome) { throw "Chrome for Testing chrome.exe was not found" }
+          New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+          Copy-Item (Join-Path $chrome.DirectoryName "*") $targetDir -Recurse -Force
+          if (!(Test-Path (Join-Path $targetDir "chrome.exe"))) {
+            throw "Chrome for Testing staging failed"
+          }
+
+          "DOMAINFLOW_CFT_PROGRAM_FILES=$fakeProgramFiles" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "DOMAINFLOW_CFT_VERSION=$($stable.version)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Isolated Chrome for Testing browser diagnostics E2E
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:DOMAINFLOW_CFT_PROGRAM_FILES)) {
+            throw "Chrome for Testing staging path is missing"
+          }
+          # Chrome 137+ intentionally removed --load-extension from branded
+          # release Chrome. Chrome for Testing is the supported automation
+          # surface; expose its isolated staging root only to this validator.
+          $env:ProgramFiles = $env:DOMAINFLOW_CFT_PROGRAM_FILES
+          Write-Host "Using Chrome for Testing $env:DOMAINFLOW_CFT_VERSION"
           $report = Join-Path $env:RUNNER_TEMP "domainflow-browser-e2e"
           .\tools\validate-windows.ps1 `
             -BinaryRoot ".\target\x86_64-pc-windows-msvc\release" `
@@ -333,7 +398,7 @@ jobs:
           Release gates completed before publication:
           - Rust 1.88 format, check, tests, Clippy with \`-D warnings\`, and release build
           - Windows MSVC check, Clippy, and release build against Npcap SDK 1.16
-          - isolated Edge/Chrome extension E2E using a temporary profile and SQLite database
+          - isolated Chrome for Testing extension E2E using a temporary profile and SQLite database
           - Receiver outage queueing and automatic replay after Receiver recovery
           - release-package content and forbidden-file scan
 
