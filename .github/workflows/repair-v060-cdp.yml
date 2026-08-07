@@ -1,0 +1,162 @@
+name: repair-v060-cdp
+
+on:
+  push:
+    branches:
+      - agent/v060-reliability-e2e
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: agent/v060-reliability-e2e
+
+      - name: Repair Service Worker CDP control path
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+
+          path = Path("tools/validate-windows.ps1")
+          text = path.read_text(encoding="utf-8")
+
+          def replace_once(old: str, new: str, label: str) -> None:
+              global text
+              if new in text:
+                  return
+              if old not in text:
+                  raise SystemExit(f"{label}: expected source block not found")
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              "$BrowserSocket = $null\n$ServiceSession = $null",
+              "$BrowserSocket = $null\n$ExtensionSocket = $null\n$ServiceSession = $null",
+              "extension socket declaration",
+          )
+
+          marker = '''function Get-OwnedBrowserProcesses {
+          '''
+          helper = '''function Find-CdpTargetDebuggerUrl {
+              param(
+                  [int]$Port,
+                  [string]$TargetId,
+                  [int]$TimeoutSeconds
+              )
+              $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+              while ([DateTime]::UtcNow -lt $deadline) {
+                  foreach ($path in @("/json/list", "/json")) {
+                      try {
+                          $targets = @(Invoke-RestMethod -Uri "http://127.0.0.1:$Port$path" -TimeoutSec 3)
+                          $match = @($targets | Where-Object {
+                              ([string]$_.id -eq $TargetId -or [string]$_.targetId -eq $TargetId) -and
+                              -not [string]::IsNullOrWhiteSpace([string]$_.webSocketDebuggerUrl)
+                          })
+                          if ($match.Count -gt 0) {
+                              return [string]$match[0].webSocketDebuggerUrl
+                          }
+                      } catch {
+                          # The target list can race a waking MV3 service worker; retry below.
+                      }
+                  }
+                  Start-Sleep -Milliseconds 200
+              }
+              return $null
+          }
+
+          function Get-OwnedBrowserProcesses {
+          '''
+          if "function Find-CdpTargetDebuggerUrl" not in text:
+              if marker not in text:
+                  raise SystemExit("CDP debugger helper insertion marker not found")
+              text = text.replace(marker, helper, 1)
+
+          old_control = '''    $attach = Send-Cdp $BrowserSocket "Target.attachToTarget" @{ targetId = $extensionTarget.target.targetId; flatten = $true }
+              $ServiceSession = [string]$attach.sessionId
+              $previous = Evaluate-Cdp $BrowserSocket $ServiceSession "new Promise(resolve => chrome.storage.local.get({diagnosticsEnabled:false, receiverPort:38765}).then(resolve))"
+              $PreviousDiagnosticsEnabled = [bool]$previous.diagnosticsEnabled
+              $setExpression = "new Promise((resolve,reject)=>chrome.storage.local.set({diagnosticsEnabled:true,receiverPort:$ReceiverPort}).then(()=>resolve(true)).catch(e=>reject(String(e))))"
+              [void](Evaluate-Cdp $BrowserSocket $ServiceSession $setExpression)
+              Add-Result "Extension diagnostics enabled" "PASS" "receiverPort=$ReceiverPort"
+          '''
+          new_control = '''    $serviceDebuggerUrl = Find-CdpTargetDebuggerUrl $BrowserDebugPort ([string]$extensionTarget.target.targetId) 15
+              Assert-Evidence (-not [string]::IsNullOrWhiteSpace($serviceDebuggerUrl)) "Extension Service Worker debugger URL" ([string]$extensionTarget.target.targetId)
+              $ExtensionSocket = Connect-Cdp $serviceDebuggerUrl
+              [void](Send-Cdp $ExtensionSocket "Runtime.enable" @{})
+              $runtimeProbe = Evaluate-Cdp $ExtensionSocket "" "({hasChrome:typeof chrome==='object',hasStorage:typeof chrome==='object' && !!chrome.storage && !!chrome.storage.local})"
+              Assert-Evidence ([bool]$runtimeProbe.hasChrome -and [bool]$runtimeProbe.hasStorage) "Extension Runtime context" ($runtimeProbe | ConvertTo-Json -Compress)
+              $previous = Evaluate-Cdp $ExtensionSocket "" "new Promise(resolve => chrome.storage.local.get({diagnosticsEnabled:false, receiverPort:38765}).then(resolve))"
+              $PreviousDiagnosticsEnabled = [bool]$previous.diagnosticsEnabled
+              $setExpression = "new Promise((resolve,reject)=>chrome.storage.local.set({diagnosticsEnabled:true,receiverPort:$ReceiverPort}).then(()=>resolve(true)).catch(e=>reject(String(e))))"
+              [void](Evaluate-Cdp $ExtensionSocket "" $setExpression)
+              Add-Result "Extension diagnostics enabled" "PASS" "receiverPort=$ReceiverPort"
+          '''
+          replace_once(old_control, new_control, "service worker control block")
+
+          text = text.replace(
+              'Evaluate-Cdp $BrowserSocket $ServiceSession',
+              'Evaluate-Cdp $ExtensionSocket ""',
+          )
+
+          old_finally = '''    if ($null -ne $BrowserSocket -and -not [string]::IsNullOrWhiteSpace($ServiceSession)) {
+          '''
+          new_finally = '''    if ($null -ne $ExtensionSocket) {
+          '''
+          replace_once(old_finally, new_finally, "finally extension socket guard")
+
+          old_restore = '''            [void](Evaluate-Cdp $ExtensionSocket "" "chrome.storage.local.set({diagnosticsEnabled:$restoreValue}).then(()=>true)")
+          '''
+          # The global replacement above already converts this line. Keep it as an assertion target.
+          if old_restore not in text:
+              raise SystemExit("extension restore call was not converted")
+
+          browser_dispose = '''    if ($null -ne $BrowserSocket) {
+              foreach ($targetId in $OwnedTargets) {
+          '''
+          extension_dispose = '''    if ($null -ne $ExtensionSocket) {
+              try { $ExtensionSocket.Dispose() } catch { }
+          }
+
+              if ($null -ne $BrowserSocket) {
+              foreach ($targetId in $OwnedTargets) {
+          '''
+          if "try { $ExtensionSocket.Dispose() }" not in text:
+              if browser_dispose not in text:
+                  raise SystemExit("browser dispose block not found")
+              text = text.replace(browser_dispose, extension_dispose, 1)
+
+          path.write_text(text, encoding="utf-8")
+          '@ | python -
+
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path tools\validate-windows.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host $_.Message }
+            throw "Repaired validator contains PowerShell syntax errors"
+          }
+          Select-String -Path tools\validate-windows.ps1 -Pattern 'Find-CdpTargetDebuggerUrl' -Quiet | ForEach-Object { if (-not $_) { throw "Direct target debugger helper missing" } }
+          Select-String -Path tools\validate-windows.ps1 -Pattern 'Extension Runtime context' -Quiet | ForEach-Object { if (-not $_) { throw "Runtime context gate missing" } }
+
+      - name: Commit repair and remove temporary workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/repair-v060-cdp.yml
+          git add tools/validate-windows.ps1 .github/workflows/repair-v060-cdp.yml
+          git diff --cached --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Harden Service Worker CDP validation"
+          git push origin HEAD:agent/v060-reliability-e2e
