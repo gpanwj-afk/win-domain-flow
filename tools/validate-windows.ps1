@@ -500,18 +500,18 @@ try {
     $extensionOrigin = [string]$Matches[1]
     $popupTarget = Send-Cdp $BrowserSocket "Target.createTarget" @{ url = "$extensionOrigin/popup.html" }
     $OwnedTargets.Add([string]$popupTarget.targetId) | Out-Null
-    $popupDebuggerUrl = Find-CdpTargetDebuggerUrl $BrowserDebugPort ([string]$popupTarget.targetId) 15
-    Assert-Evidence (-not [string]::IsNullOrWhiteSpace($popupDebuggerUrl)) "Extension popup debugger URL" ([string]$popupTarget.targetId)
-    $ExtensionSocket = Connect-Cdp $popupDebuggerUrl
-    [void](Send-Cdp $ExtensionSocket "Runtime.enable" @{})
-    $runtimeProbe = Evaluate-Cdp $ExtensionSocket "" "({hasChrome:typeof chrome==='object',hasRuntime:typeof chrome==='object' && !!chrome.runtime && !!chrome.runtime.sendMessage,hasStorage:typeof chrome==='object' && !!chrome.storage && !!chrome.storage.local})"
+    $popupAttach = Send-Cdp $BrowserSocket "Target.attachToTarget" @{ targetId = [string]$popupTarget.targetId; flatten = $true }
+    $ServiceSession = [string]$popupAttach.sessionId
+    Assert-Evidence (-not [string]::IsNullOrWhiteSpace($ServiceSession)) "Extension popup CDP session" $ServiceSession
+    [void](Send-Cdp $BrowserSocket "Runtime.enable" @{} $ServiceSession)
+    $runtimeProbe = Evaluate-Cdp $BrowserSocket $ServiceSession "({hasChrome:typeof chrome==='object',hasRuntime:typeof chrome==='object' && !!chrome.runtime && !!chrome.runtime.sendMessage,hasStorage:typeof chrome==='object' && !!chrome.storage && !!chrome.storage.local})"
     Assert-Evidence ([bool]$runtimeProbe.hasChrome -and [bool]$runtimeProbe.hasRuntime -and [bool]$runtimeProbe.hasStorage) "Extension popup Runtime context" ($runtimeProbe | ConvertTo-Json -Compress)
-    $previous = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:'diagnostics-health'})"
+    $previous = Evaluate-Cdp $BrowserSocket $ServiceSession "chrome.runtime.sendMessage({type:'diagnostics-health'})"
     Assert-Evidence ([bool]$previous.ok) "Extension popup Receiver health" ($previous | ConvertTo-Json -Compress)
     $PreviousDiagnosticsEnabled = [bool]$previous.enabled
-    $portResponse = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:'diagnostics-set-receiver-port',port:$ReceiverPort})"
+    $portResponse = Evaluate-Cdp $BrowserSocket $ServiceSession "chrome.runtime.sendMessage({type:'diagnostics-set-receiver-port',port:$ReceiverPort})"
     Assert-Evidence ([bool]$portResponse.ok -and [int]$portResponse.receiverPort -eq $ReceiverPort) "Extension Receiver port configured" ($portResponse | ConvertTo-Json -Compress)
-    $enableResponse = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:'diagnostics-set-enabled',enabled:true})"
+    $enableResponse = Evaluate-Cdp $BrowserSocket $ServiceSession "chrome.runtime.sendMessage({type:'diagnostics-set-enabled',enabled:true})"
     Assert-Evidence ([bool]$enableResponse.ok -and [bool]$enableResponse.enabled) "Extension diagnostics enabled" ($enableResponse | ConvertTo-Json -Compress)
 
     [void](Send-Cdp $BrowserSocket "Browser.setDownloadBehavior" @{ behavior = "allow"; downloadPath = $DownloadDir; eventsEnabled = $true })
@@ -543,7 +543,7 @@ try {
     Assert-Evidence $havePositive "Actual transferred bytes persisted" "positive_transferred_count=$($DatabaseEvidence.positive_transferred_count)"
     Assert-Evidence $haveDownload "Browser download persisted" "download_count=$($DatabaseEvidence.download_count)"
 
-    $extensionHealth = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:'diagnostics-health'})"
+    $extensionHealth = Evaluate-Cdp $BrowserSocket $ServiceSession "chrome.runtime.sendMessage({type:'diagnostics-health'})"
     Assert-Evidence ([bool]$extensionHealth.enabled) "Extension runtime enabled" ($extensionHealth | ConvertTo-Json -Compress)
     Assert-Evidence ([int]$extensionHealth.attachedTabs -gt 0) "At least one browser tab attached" "attachedTabs=$($extensionHealth.attachedTabs)"
     Assert-Evidence ([string]::IsNullOrWhiteSpace([string]$extensionHealth.lastReceiverError)) "Extension Receiver delivery healthy" "queueLength=$($extensionHealth.queueLength)"
@@ -566,7 +566,7 @@ try {
     $receiverErrorDuringOutage = $false
     do {
         Start-Sleep -Milliseconds 400
-        $outageHealth = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:'diagnostics-health'})"
+        $outageHealth = Evaluate-Cdp $BrowserSocket $ServiceSession "chrome.runtime.sendMessage({type:'diagnostics-health'})"
         $queuedDuringOutage = [int]$outageHealth.queueLength -gt 0
         $receiverErrorDuringOutage = -not [string]::IsNullOrWhiteSpace([string]$outageHealth.lastReceiverError)
     } while ((-not ($queuedDuringOutage -and $receiverErrorDuringOutage)) -and [DateTime]::UtcNow -lt $deadline)
@@ -595,7 +595,7 @@ try {
     $outageEventsPersisted = $false
     do {
         Start-Sleep -Milliseconds 500
-        $recoveryHealth = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:'diagnostics-health'})"
+        $recoveryHealth = Evaluate-Cdp $BrowserSocket $ServiceSession "chrome.runtime.sendMessage({type:'diagnostics-health'})"
         $DatabaseEvidence = Query-TestDatabase $Python $TestDb
         $queueRecovered = [int]$recoveryHealth.queueLength -eq 0 -and [string]::IsNullOrWhiteSpace([string]$recoveryHealth.lastReceiverError)
         $outageEventsPersisted = [int]$DatabaseEvidence.request_count -gt $beforeRestartCount
@@ -626,11 +626,11 @@ try {
     }
 } finally {
     # Restore the diagnostics flag in the dedicated profile before teardown.
-    if ($null -ne $ExtensionSocket) {
+    if ($null -ne $BrowserSocket -and -not [string]::IsNullOrWhiteSpace($ServiceSession)) {
         try {
             $restoreValue = if ($PreviousDiagnosticsEnabled) { "true" } else { "false" }
-            $restorePort = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:'diagnostics-set-receiver-port',port:38765})"
-    $restoreEnabled = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:'diagnostics-set-enabled',enabled:$restoreValue})"
+            $restorePort = Evaluate-Cdp $BrowserSocket $ServiceSession "chrome.runtime.sendMessage({type:'diagnostics-set-receiver-port',port:38765})"
+    $restoreEnabled = Evaluate-Cdp $BrowserSocket $ServiceSession "chrome.runtime.sendMessage({type:'diagnostics-set-enabled',enabled:$restoreValue})"
     if (-not [bool]$restorePort.ok -or -not [bool]$restoreEnabled.ok) { throw "Extension settings restore was rejected" }
             Add-Result "Extension diagnostics setting restored" "PASS" "diagnosticsEnabled=$restoreValue; receiverPort=38765"
         } catch {
