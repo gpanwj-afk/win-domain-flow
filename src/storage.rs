@@ -147,6 +147,7 @@ impl Storage {
 
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
+        preflight_schema_version(&conn)?;
         conn.execute_batch(SCHEMA_SQL)?;
         validate_pragmas(&conn)?;
         validate_schema_version(&conn)?;
@@ -230,6 +231,22 @@ fn validate_pragmas(conn: &Connection) -> Result<(), StorageError> {
     }
 
     Ok(())
+}
+
+fn schema_meta_exists(conn: &Connection) -> Result<bool, StorageError> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+fn preflight_schema_version(conn: &Connection) -> Result<(), StorageError> {
+    if !schema_meta_exists(conn)? {
+        return Ok(());
+    }
+    validate_schema_version(conn)
 }
 
 fn read_schema_version(conn: &Connection) -> Result<i64, StorageError> {
@@ -404,6 +421,17 @@ mod tests {
         let _ = fs::remove_file(path.with_extension("db-shm"));
     }
 
+    fn table_exists(path: &Path, table: &str) -> bool {
+        let conn = Connection::open(path).unwrap();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            != 0
+    }
+
     fn delta(day_start_utc: i64, domain: &str, bytes: u64, packets: u64) -> DomainDelta {
         DomainDelta {
             day_start_utc,
@@ -430,6 +458,41 @@ mod tests {
         assert_eq!(synchronous, SQLITE_SYNCHRONOUS_NORMAL);
 
         drop(storage);
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn future_schema_is_rejected_before_domain_ddl() {
+        let path = temp_db_path("future_schema");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_meta (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             ) WITHOUT ROWID;
+             INSERT INTO schema_meta (key, value) VALUES ('schema_version', '2');",
+        )
+        .unwrap();
+        drop(conn);
+        assert!(!table_exists(&path, "domain_daily"));
+
+        let error = match Storage::open(&path) {
+            Ok(_) => panic!("future base schema should be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StorageError::UnsupportedSchemaVersion(2)));
+        assert!(!table_exists(&path, "domain_daily"));
+
+        let conn = Connection::open(&path).unwrap();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "2");
+        drop(conn);
         cleanup_db(&path);
     }
 
