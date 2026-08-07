@@ -40,7 +40,7 @@ settings.conf
 
 GUI 会直接显示当前实际数据库的绝对路径，不再在工作目录数据库和 LOCALAPPDATA 数据库之间静默选择。
 
-如果此前没有保存过明确数据库路径，而程序工作目录存在旧 `domainflow.db`，0.6 会通过 SQLite online backup API 创建一致性快照到固定目录：
+如果旧版本使用的是程序自动选择的工作目录 `domainflow.db`，无论该默认路径是否已经被旧版写入 `settings.conf`，0.6 都会识别这一精确旧默认路径，并通过 SQLite online backup API 创建一致性快照到固定目录。用户真正手工指定的自定义数据库路径不会被自动迁移：
 
 - 包含已提交但仍在 WAL 中的数据
 - 不执行 `wal_checkpoint(TRUNCATE)`
@@ -118,7 +118,7 @@ http://127.0.0.1:38765/status
 
 `/status` 可核对 Receiver PID、数据库绝对路径、事件计数和最近错误。
 
-浏览器事件写入 `/events` 时必须来自 0.6 发行扩展的精确 Origin。缺失 Origin、其他扩展 ID 和普通网页来源会被拒绝。
+浏览器事件写入 `/events` 时必须来自 0.6 发行扩展的精确 Origin。缺失 Origin、其他扩展 ID和普通网页来源会被拒绝。
 
 ## 七、Receiver 暂时不可用时
 
@@ -126,7 +126,7 @@ http://127.0.0.1:38765/status
 
 0.6 使用：
 
-- 持久化有界队列
+- 持久化有界队列，按事件条数和本地存储容量双重限制
 - JSON ACK
 - 指数退避
 - `chrome.alarms` 自动恢复补发
@@ -253,7 +253,7 @@ validation-report.xml
 validation-manifest.json
 ```
 
-manifest 记录 commit、二进制 SHA-256、Receiver PID/端口、浏览器 PID、Profile、扩展 ID 和测试数据库路径。
+manifest 记录 commit、二进制 SHA-256、Receiver PID/端口、浏览器 PID、Profile、扩展 ID和测试数据库路径。
 
 ## 十二、常见问题
 
