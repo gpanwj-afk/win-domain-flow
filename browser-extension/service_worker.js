@@ -4,6 +4,10 @@ const PROTOCOL_VERSION = "1.3";
 const PARTIAL_REPORT_BYTES = 1024 * 1024;
 const PARTIAL_REPORT_MS = 5000;
 const MAX_QUEUE_LENGTH = 1000;
+// Chrome 113 and earlier expose roughly 5 MiB for storage.local. Reserve
+// headroom for settings and browser bookkeeping instead of relying only on a
+// count limit, because a small number of long URLs can otherwise exhaust it.
+const MAX_QUEUE_BYTES = 4 * 1024 * 1024;
 const RETRY_BASE_MS = 500;
 const RETRY_MAX_MS = 30000;
 const RETRY_ALARM = "domainflow-retry";
@@ -203,11 +207,46 @@ function mergePayload(previous, next) {
   return merged;
 }
 
+function queueStorageBytes() {
+  try {
+    const serialized = JSON.stringify({
+      [QUEUE_STORAGE_KEY]: eventQueue,
+      droppedEventCount
+    });
+    return new TextEncoder().encode(serialized).byteLength;
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
+}
+
+function trimQueueToBounds() {
+  let dropped = 0;
+  while (
+    eventQueue.length > 0 &&
+    (eventQueue.length > MAX_QUEUE_LENGTH || queueStorageBytes() > MAX_QUEUE_BYTES)
+  ) {
+    eventQueue.shift();
+    dropped += 1;
+  }
+  if (dropped > 0) {
+    droppedEventCount += dropped;
+    lastReceiverError = `发送队列达到容量上限，已丢弃最旧事件（本次 ${dropped} 条，累计 ${droppedEventCount} 条）`;
+  }
+  return dropped;
+}
+
 async function persistQueue() {
-  await chrome.storage.local.set({
-    [QUEUE_STORAGE_KEY]: eventQueue,
-    droppedEventCount
-  });
+  const dropped = trimQueueToBounds();
+  try {
+    await chrome.storage.local.set({
+      [QUEUE_STORAGE_KEY]: eventQueue,
+      droppedEventCount
+    });
+    return { ok: true, dropped };
+  } catch (error) {
+    lastReceiverError = `发送队列持久化失败：${error && error.message ? error.message : error}`;
+    return { ok: false, dropped };
+  }
 }
 
 async function scheduleRetry(whenMs) {
@@ -260,8 +299,12 @@ async function processQueue() {
           entry.attempts = 0;
           entry.nextAttemptAt = 0;
         }
-        lastReceiverError = null;
-        await persistQueue();
+        const persisted = await persistQueue();
+        if (!persisted.ok) {
+          await scheduleRetry(Date.now() + RETRY_BASE_MS);
+          break;
+        }
+        if (persisted.dropped === 0) lastReceiverError = null;
       } catch (error) {
         entry.attempts = Math.max(0, Number(entry.attempts) || 0) + 1;
         const backoff = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * (2 ** Math.min(entry.attempts - 1, 8)));
@@ -284,27 +327,31 @@ async function processQueue() {
   }
 }
 
+function sameQueuedEvent(entry, payload) {
+  return Boolean(
+    entry &&
+    entry.payload &&
+    entry.payload.kind === payload.kind &&
+    entry.payload.eventId === payload.eventId
+  );
+}
+
 async function enqueueEvent(payload) {
   if (!payload || !payload.eventId) return false;
-  const existingIndex = eventQueue.findIndex(
-    (entry) => entry && entry.payload && entry.payload.kind === payload.kind && entry.payload.eventId === payload.eventId
-  );
+  const existingIndex = eventQueue.findIndex((entry) => sameQueuedEvent(entry, payload));
   if (existingIndex >= 0) {
     eventQueue[existingIndex].payload = mergePayload(eventQueue[existingIndex].payload, payload);
     eventQueue[existingIndex].revision = (Number(eventQueue[existingIndex].revision) || 0) + 1;
     eventQueue[existingIndex].attempts = 0;
     eventQueue[existingIndex].nextAttemptAt = 0;
   } else {
-    if (eventQueue.length >= MAX_QUEUE_LENGTH) {
-      eventQueue.shift();
-      droppedEventCount += 1;
-      lastReceiverError = `发送队列已满，已丢弃最旧事件（累计 ${droppedEventCount} 条）`;
-    }
     eventQueue.push({ payload, attempts: 0, nextAttemptAt: 0, revision: 0 });
   }
-  await persistQueue();
+  const persisted = await persistQueue();
+  const retained = eventQueue.some((entry) => sameQueuedEvent(entry, payload));
+  if (!persisted.ok) await scheduleRetry(Date.now() + RETRY_BASE_MS);
   processQueue();
-  return true;
+  return retained && persisted.ok;
 }
 
 function requestPayload(item, errorText = null) {
@@ -333,9 +380,16 @@ function requestPayload(item, errorText = null) {
 async function reportRequest(item, errorText = null) {
   if (!item || shouldIgnore(item.url) || !item.host) return false;
   const payload = requestPayload(item, errorText);
-  // Each request owns a promise chain so partial and final reports cannot
-  // overtake each other before entering the centralized FIFO delivery queue.
-  item.reportChain = (item.reportChain || Promise.resolve()).then(() => enqueueEvent(payload));
+  // Recover from any previous asynchronous persistence error before appending
+  // the next report. One transient storage failure must not poison this
+  // request's report chain for the rest of its lifetime.
+  item.reportChain = (item.reportChain || Promise.resolve())
+    .catch(() => false)
+    .then(() => enqueueEvent(payload))
+    .catch((error) => {
+      lastReceiverError = `发送队列处理失败：${error && error.message ? error.message : error}`;
+      return false;
+    });
   const queued = await item.reportChain;
   if (queued) {
     item.lastReportedBytes = item.transferredBytes ?? item.lastReportedBytes;
@@ -672,17 +726,19 @@ async function initialize() {
   diagnosticsEnabled = Boolean(values.diagnosticsEnabled);
   receiverPort = validPort(values.receiverPort);
   droppedEventCount = positiveInteger(values.droppedEventCount) || 0;
-  eventQueue = Array.isArray(values[QUEUE_STORAGE_KEY])
-    ? values[QUEUE_STORAGE_KEY]
-        .filter((entry) => entry && entry.payload && entry.payload.eventId)
-        .slice(-MAX_QUEUE_LENGTH)
-        .map((entry) => ({
-          ...entry,
-          revision: Number(entry.revision) || 0,
-          attempts: Math.max(0, Number(entry.attempts) || 0),
-          nextAttemptAt: Math.max(0, Number(entry.nextAttemptAt) || 0)
-        }))
-    : [];
+  const storedQueue = Array.isArray(values[QUEUE_STORAGE_KEY]) ? values[QUEUE_STORAGE_KEY] : [];
+  eventQueue = storedQueue
+    .filter((entry) => entry && entry.payload && entry.payload.eventId)
+    .map((entry) => ({
+      ...entry,
+      revision: Number(entry.revision) || 0,
+      attempts: Math.max(0, Number(entry.attempts) || 0),
+      nextAttemptAt: Math.max(0, Number(entry.nextAttemptAt) || 0)
+    }));
+  const invalidDropped = storedQueue.length - eventQueue.length;
+  if (invalidDropped > 0) droppedEventCount += invalidDropped;
+  const trimmed = trimQueueToBounds();
+  if (invalidDropped > 0 || trimmed > 0) await persistQueue();
   processQueue();
   if (diagnosticsEnabled) await attachAllTabs();
   await updateBadge();
