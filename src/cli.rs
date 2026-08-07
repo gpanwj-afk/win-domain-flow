@@ -140,8 +140,8 @@ pub fn run_with_writer<W: Write>(cli: Cli, out: &mut W) -> anyhow::Result<()> {
             Ok(())
         }
         Command::BrowserReceiver { db, port } => {
-            if !(1024..=65535).contains(&port) {
-                anyhow::bail!("--port must be in 1024..=65535");
+            if port != 0 && !(1024..=65535).contains(&port) {
+                anyhow::bail!("--port must be 0 or in 1024..=65535");
             }
             let server = BrowserActivityServer::spawn_on(db, port)
                 .map_err(|error| anyhow::anyhow!(error))?;
@@ -217,13 +217,8 @@ mod tests {
 
     #[test]
     fn cli_parses_browser_receiver_defaults() {
-        let cli = Cli::try_parse_from([
-            "win-domain-flow",
-            "browser-receiver",
-            "--db",
-            "test.db",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["win-domain-flow", "browser-receiver", "--db", "test.db"])
+            .unwrap();
         match cli.command {
             Command::BrowserReceiver { db, port } => {
                 assert_eq!(db, PathBuf::from("test.db"));

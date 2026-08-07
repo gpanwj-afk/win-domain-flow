@@ -80,7 +80,8 @@ impl AppSettings {
                 };
                 match key {
                     "selected_device" => {
-                        settings.selected_device = decode_hex(value).filter(|value| !value.is_empty());
+                        settings.selected_device =
+                            decode_hex(value).filter(|value| !value.is_empty());
                     }
                     "database_path" => {
                         if let Some(value) = decode_hex(value) {
