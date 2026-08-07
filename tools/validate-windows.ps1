@@ -228,16 +228,27 @@ function Evaluate-Cdp {
 }
 
 function Find-ExtensionTarget {
-    param([Net.WebSockets.ClientWebSocket]$Socket, [int]$TimeoutSeconds)
+    param(
+        [Net.WebSockets.ClientWebSocket]$Socket,
+        [int]$TimeoutSeconds,
+        [string]$ExpectedExtensionId
+    )
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
         $targets = (Send-Cdp $Socket "Target.getTargets" @{}).targetInfos
         foreach ($target in $targets) {
             if ($target.type -notin @("service_worker", "background_page")) { continue }
             if ($target.url -match '^(chrome|edge)-extension://([a-p]{32})/') {
+                $candidateId = [string]$Matches[2]
+                if (
+                    -not [string]::IsNullOrWhiteSpace($ExpectedExtensionId) -and
+                    $candidateId -ne $ExpectedExtensionId
+                ) {
+                    continue
+                }
                 return [pscustomobject]@{
                     target = $target
-                    extensionId = $Matches[2]
+                    extensionId = $candidateId
                 }
             }
         }
@@ -412,10 +423,10 @@ try {
     $BrowserSocket = Connect-Cdp "ws://127.0.0.1:$BrowserDebugPort$BrowserWsPath"
     Add-Result "Dedicated browser profile" "PASS" $ProfileDir
 
-    $extensionTarget = Find-ExtensionTarget $BrowserSocket 30
+    $extensionTarget = Find-ExtensionTarget $BrowserSocket 30 ([string]$ReceiverStatus.expected_extension_id)
     if ($null -eq $extensionTarget) {
-        Add-Result "Dynamic extension discovery" "EVIDENCE_INSUFFICIENT" "No extension service worker target appeared"
-        throw "Could not dynamically discover the unpacked extension ID"
+        Add-Result "Dynamic extension discovery" "EVIDENCE_INSUFFICIENT" "Expected packaged extension service worker did not appear"
+        throw "Could not dynamically discover the packaged extension with the Receiver-approved ID"
     }
     $ExtensionId = [string]$extensionTarget.extensionId
     $Manifest.extension_id = $ExtensionId
