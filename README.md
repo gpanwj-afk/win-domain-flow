@@ -1,21 +1,81 @@
-# win-domain-flow 0.5.1
+# win-domain-flow 0.6
 
 Windows 本机应用、域名与浏览器活动诊断工具。
 
 基础模式通过 Npcap 捕获 HTTPS 流量，将数据按“应用 → 域名 → 日期”持久化到 SQLite；需要追查某个浏览器域名究竟在做什么时，可以临时启用随程序打包的 Edge/Chrome 扩展，查看请求 URL、实际编码传输字节、资源类型、MIME、来源页面，以及真实下载文件记录。
 
-## v0.5 主要变化
+## v0.6 重点变化
 
-- GUI 卡片根据窗口宽度自动调整列数与宽度
-- 小窗口中应用区、域名区自动改为上下排列
-- 左侧控制栏可以拖动调整宽度
-- 主内容区域支持整体滚动
-- 保留明亮模式、深色模式及主题记忆
-- 主界面回归“应用与域名总量”，不再用上行/下行、TCP/UDP 标签冒充业务用途
-- 新增可选“浏览器活动诊断”区域
-- 新增随包提供的 Edge/Chrome 扩展，默认关闭
-- 浏览器请求按实际编码传输字节排序，而不是只看响应头声明大小
-- 浏览器下载记录可显示文件名、保存路径、最终 URL、MIME、总大小与完成状态
+### 浏览器事件不再“一次失败就丢”
+
+扩展现在使用持久化有界发送队列：
+
+- 最多保存 1000 条待发送事件
+- 队列保存在 `chrome.storage.local`
+- Receiver 不可用时指数退避重试
+- 使用 `chrome.alarms` 支持 Manifest V3 Service Worker 被挂起后的恢复补发
+- Receiver 必须返回合法 JSON 且明确 `ok=true, accepted=true` 才视为送达
+- Popup 可看到待补发数量、最近 Receiver 错误和丢弃计数
+
+### 实际传输字节采用单调更新
+
+同一个请求多次上报时，SQLite 中 `transferred_bytes` 只会保留更大的已知值。例如先记录 `8192`，之后收到延迟的 `0`，最终仍保持 `8192`。
+
+`null` 代表“浏览器尚未测得”，真实的 0 和未知不再混在一起。
+
+### 请求上报顺序与重定向
+
+- 同一 request 的部分上报、最终上报先进入串行 report chain，再进入统一 FIFO 队列。
+- CDP 30x 重定向复用 `requestId` 时，会先保存前一跳，再记录新 URL，避免覆盖。
+
+### Receiver 鉴权与状态接口
+
+扩展使用固定发行公钥，身份在重新加载后保持稳定。Receiver 只接受该发行扩展的精确 `chrome-extension://` / `edge-extension://` Origin 写入 `/events`。
+
+缺失 Origin、错误扩展 ID 或普通网页来源均会被拒绝。
+
+新增：
+
+```text
+GET http://127.0.0.1:38765/health
+GET http://127.0.0.1:38765/status
+```
+
+`/status` 返回：
+
+- 产品标识
+- Receiver PID
+- 实际端口
+- 当前 SQLite 绝对路径
+- 接收事件计数
+- 最近事件时间
+- 最近错误
+- 期望的扩展 ID
+
+### 单实例与端口冲突
+
+GUI 启动前会探测现有 `win-domain-flow` Receiver。若已有实例运行，第二个窗口只显示已有实例的 PID、端口和数据库路径，不再启动第二套抓包或数据库写入链路。
+
+浏览器诊断区遇到端口冲突时也会尽量显示已有产品实例信息，而不是表现成“正常启动”。
+
+### 数据库路径不再静默分叉
+
+默认数据库固定为：
+
+```text
+%LOCALAPPDATA%\win-domain-flow\domainflow.db
+```
+
+GUI 会明确显示实际使用的绝对路径。
+
+若用户没有保存过明确数据库路径，但旧工作目录存在 `domainflow.db`，程序会使用 SQLite online backup API 将旧库复制到固定数据目录：
+
+- 读取源库时不执行 WAL checkpoint
+- 已提交但仍在 WAL 中的数据也会进入快照
+- 原数据库文件保留不删除
+- 迁移失败时明确提示，并明确继续使用哪个旧库
+
+设置保存失败也会显示到 GUI，不再静默忽略。
 
 ## 两种使用模式
 
@@ -46,13 +106,7 @@ Windows 本机应用、域名与浏览器活动诊断工具。
 └─ 浏览器下载文件名、保存路径、最终 URL 与文件大小
 ```
 
-例如，筛选 `tlabel.tencent.com` 后，可以判断数百 MiB 流量主要来自：
-
-- 某个视频或音频分片 URL
-- 大体积 Fetch/XHR 接口响应
-- 模型、压缩包或二进制资源
-- 图片、字体、脚本等静态资源
-- 浏览器下载管理器中的实际文件下载
+例如筛选 `tlabel.tencent.com`，可以判断大流量主要来自视频分片、大体积接口、模型/二进制资源、静态资源，还是浏览器下载文件。
 
 ## 浏览器扩展安装
 
@@ -61,13 +115,15 @@ Windows 本机应用、域名与浏览器活动诊断工具。
 3. Edge 打开 `edge://extensions`，Chrome 打开 `chrome://extensions`。
 4. 开启“开发人员模式”。
 5. 点击“加载解压缩的扩展”。
-6. 选择程序目录中的 `browser-extension` 文件夹。
+6. 选择发行包中的 `browser-extension` 文件夹。
 7. 固定扩展图标。
-8. 点击扩展图标，打开“启用深度诊断”。
+8. 打开“启用深度诊断”。
 9. 重新加载需要排查的网页。
-10. 在 GUI 中输入目标域名进行筛选。
+10. 在 GUI 输入目标域名。
 
-启用后浏览器会显示“此扩展程序正在调试此浏览器”的标准提示，这是读取 Network 元数据和实际传输字节所需的浏览器安全提示。排查结束后可以在扩展弹窗中关闭深度诊断。
+从旧版升级到 0.6 时建议在扩展管理页重新加载当前发行包中的扩展。0.6 起使用固定公钥，因此后续发行包的扩展身份稳定。
+
+启用后浏览器会显示“此扩展程序正在调试此浏览器”的标准提示，这是浏览器自己的安全提示。
 
 扩展详细说明见 [`browser-extension/README_CN.md`](browser-extension/README_CN.md)。
 
@@ -99,36 +155,70 @@ Windows 本机应用、域名与浏览器活动诊断工具。
 
 扩展没有调用 `Network.getResponseBody`，桌面程序也不会安装中间人证书或注入浏览器进程。
 
-## 统计口径
-
-基础 Npcap 流量使用抓包报告的线上长度，包含链路层、IP、传输层头部和重传。
-
-浏览器诊断中的“实际传输”是浏览器调试协议报告的响应编码数据长度，用于比较哪个 URL 真正消耗了数据。它通常不包含所有链路层和协议头部，也不等同于 Npcap 总流量，所以两者不要求完全相等。
-
-当浏览器没有提供实际传输字节时，界面会回退到响应头声明大小，并明确标注“响应声明”。
-
 ## 数据持久化
 
-关闭 GUI 或重启电脑不会清空数据。默认数据库：
+关闭 GUI 或重启电脑不会清空数据。默认显示“本月累计”。
+
+浏览器请求和下载记录与基础流量记录写入同一个当前明确选择的 SQLite 数据库。
+
+## 隔离验证工具
+
+发行包包含：
 
 ```text
-%LOCALAPPDATA%\win-domain-flow\domainflow.db
+tools\validate-windows.ps1
+tools\browser_fixture.py
+tools\query_e2e_db.py
 ```
 
-默认显示“本月累计”。只有主动删除数据库文件或改用其他数据库，累计数据才会变化。
+源码构建完成后可运行：
 
-浏览器请求与下载记录也写入同一个 SQLite 文件。
+```powershell
+.\tools\validate-windows.ps1 `
+  -BinaryRoot .\target\release `
+  -OutputDirectory .\validation-report
+```
+
+验证器的设计原则：
+
+- 独立临时 Edge/Chrome Profile，不操作用户默认 Profile
+- 浏览器远程调试端口由 OS 动态分配
+- Receiver 测试端口由 OS 动态分配
+- 独立临时 SQLite，不写用户真实数据库
+- 本机 fixture 只绑定 `127.0.0.1`，不依赖公网
+- 使用 CDP `Target.createTarget` 创建测试页，不用 `Start-Process msedge.exe URL`
+- 从 Service Worker URL 动态发现实际扩展 ID，不依赖历史 ID
+- 只停止命令行包含本次临时 Profile 的浏览器 PID
+- Receiver 停止失败时不会启动第二个 Receiver
+- 使用 SQLite `mode=ro` 查询，不看 DB 文件时间，不执行 checkpoint
+- 会故意在 Receiver 停机期间产生浏览器事件，并验证队列在恢复后自动补发
+- 测试结束恢复扩展诊断开关
+- 输出 JSON、JUnit XML 和测试 manifest
+
+manifest 包含 commit、二进制 SHA-256、Receiver PID/端口、浏览器 PID、临时 Profile、动态扩展 ID和临时数据库路径。
+
+## CLI 的隔离 Receiver 模式
+
+用于 CI / 自动化测试，不启动 Npcap：
+
+```powershell
+.\win-domain-flow.exe browser-receiver `
+  --db C:\Temp\domainflow-e2e.db `
+  --port 0
+```
+
+`--port 0` 表示让 Windows 自动分配可用端口。启动后 CLI 会输出实际 PID、端口和数据库路径。
 
 ## 隐私与安全
 
 - 所有数据保存在本机
-- 扩展只连接 `127.0.0.1:38765`
-- 扩展没有 `<all_urls>` 主机权限
-- 本地接收器只接受 Chrome/Edge 扩展来源的跨域请求
+- 扩展仅有 `http://127.0.0.1/*` 回环主机权限
+- 没有 `<all_urls>`
+- `/events` 只接受发行扩展的精确 Origin
 - 深度诊断默认关闭
 - 不上传域名、URL、文件名或应用信息
 
-完整 URL 的查询参数可能包含敏感标识符。虽然数据不会离开本机，仍应像保护浏览器历史记录一样保护 `domainflow.db`，不要随意分享数据库文件。
+完整 URL 的查询参数可能包含敏感标识符，应像保护浏览器历史记录一样保护 `domainflow.db`。
 
 ## 安装要求
 
@@ -136,7 +226,7 @@ Windows 本机应用、域名与浏览器活动诊断工具。
 - 官方 Npcap，建议安装时启用 `WinPcap API-compatible Mode`
 - 不要使用 Win10Pcap 替代 Npcap
 - 源码构建需要 Rust 1.88.0 MSVC
-- 源码构建需要 Visual Studio Build Tools 2022 C++ 工作负载
+- 源码构建需要 Visual Studio Build Tools C++ 工作负载
 - 源码构建需要 Npcap SDK 1.16
 
 ## 构建
@@ -186,10 +276,10 @@ target\release\win-domain-flow.exe
 
 - 浏览器活动诊断只覆盖安装了扩展的 Edge/Chrome 标签页
 - 微信、桌面客户端等非浏览器应用仍只能看到应用与域名总量
-- DevTools 与扩展不能同时独占调试同一个标签页
-- 浏览器缓存、Service Worker 和预取可能让部分请求的网络字节为零
-- ECH、QUIC、漏抓 TLS 握手等情况仍可能导致基础监控显示未知域名
-- 扩展无法说明加密正文的语义，只能用 URL、类型、MIME 和大小判断用途
+- DevTools 与扩展可能争用同一个标签页的调试连接
+- 浏览器缓存、Service Worker 和预取可能让实际网络字节为 0
+- ECH、QUIC、漏抓 TLS 握手等情况仍可能让基础监控显示未知域名
+- 扩展无法说明加密正文的语义，只能结合 URL、类型、MIME 和大小判断用途
 
 ## 质量门禁
 
@@ -201,7 +291,16 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo build --release --locked
 ```
 
-GitHub Actions 同时验证 Linux、Windows MSVC、Npcap SDK、浏览器扩展语法、安全权限和 Windows 成品包。
+GitHub Actions 额外执行：
+
+- 扩展公钥动态推导 ID 与 Rust Receiver ID 一致性检查
+- 浏览器扩展权限/隐私静态门禁
+- Receiver 真 TCP 集成测试
+- SQLite WAL online-backup 回归测试
+- Windows MSVC / Npcap SDK 构建
+- Windows dedicated-profile 浏览器端到端测试
+- Receiver 停机队列自动补发测试
+- Windows 成品包验收
 
 ## 许可证
 
