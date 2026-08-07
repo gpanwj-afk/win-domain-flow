@@ -14,6 +14,7 @@ if ([string]::IsNullOrWhiteSpace($BinaryRoot)) {
 }
 $BinaryRoot = [IO.Path]::GetFullPath($BinaryRoot)
 $Cli = Join-Path $BinaryRoot "win-domain-flow.exe"
+$ReceiverExe = Join-Path $BinaryRoot "win-domain-flow-browser-receiver.exe"
 $ExtensionDir = Join-Path $RepoRoot "browser-extension"
 $FixtureScript = Join-Path $PSScriptRoot "browser_fixture.py"
 $QueryScript = Join-Path $PSScriptRoot "query_e2e_db.py"
@@ -322,6 +323,8 @@ $Manifest = @{
     commit = $null
     binary_sha256 = $null
     cli_path = $Cli
+    receiver_executable = $ReceiverExe
+    receiver_binary_sha256 = $null
     database_path = $TestDb
     profile_path = $ProfileDir
     extension_id = $null
@@ -339,6 +342,7 @@ $Manifest = @{
 
 try {
     Assert-Evidence (Test-Path $Cli) "CLI executable exists" $Cli
+    Assert-Evidence (Test-Path $ReceiverExe) "Npcap-independent Receiver executable exists" $ReceiverExe
     Assert-Evidence (Test-Path (Join-Path $ExtensionDir "manifest.json")) "Browser extension exists" $ExtensionDir
     Assert-Evidence (Test-Path $FixtureScript) "Local fixture exists" $FixtureScript
 
@@ -346,6 +350,7 @@ try {
         $Manifest.commit = (& git -C $RepoRoot rev-parse HEAD 2>$null).Trim()
     } catch { $Manifest.commit = "unknown" }
     $Manifest.binary_sha256 = (Get-FileHash -LiteralPath $Cli -Algorithm SHA256).Hash.ToLowerInvariant()
+    $Manifest.receiver_binary_sha256 = (Get-FileHash -LiteralPath $ReceiverExe -Algorithm SHA256).Hash.ToLowerInvariant()
 
     $FixtureProcess = Start-ToolProcess $Python @($FixtureScript, "--port", "0") $RepoRoot -RedirectOutput
     $fixtureLine = $FixtureProcess.StandardOutput.ReadLine()
@@ -359,7 +364,7 @@ try {
     $fixtureHealth = Invoke-RestMethod -Uri "http://127.0.0.1:$($Fixture.port)/health" -TimeoutSec 3
     Assert-Evidence ([bool]$fixtureHealth.ok) "Local fixture health" "127.0.0.1:$($Fixture.port)"
 
-    $ReceiverProcess = Start-ToolProcess $Cli @("browser-receiver", "--db", $TestDb, "--port", "0") $RepoRoot -RedirectOutput
+    $ReceiverProcess = Start-ToolProcess $ReceiverExe @("--db", $TestDb, "--port", "0") $RepoRoot -RedirectOutput
     $receiverLine = $ReceiverProcess.StandardOutput.ReadLine()
     if ([string]::IsNullOrWhiteSpace($receiverLine)) {
         throw "Receiver did not emit startup status: $($ReceiverProcess.StandardError.ReadToEnd())"
@@ -486,7 +491,7 @@ try {
 
     # Do not start a replacement receiver unless the owned old process is
     # proven stopped. This prevents the false-positive multi-GUI scenario.
-    $ReceiverProcess = Start-ToolProcess $Cli @("browser-receiver", "--db", $TestDb, "--port", "$ReceiverPort") $RepoRoot -RedirectOutput
+    $ReceiverProcess = Start-ToolProcess $ReceiverExe @("--db", $TestDb, "--port", "$ReceiverPort") $RepoRoot -RedirectOutput
     $restartLine = $ReceiverProcess.StandardOutput.ReadLine()
     if ([string]::IsNullOrWhiteSpace($restartLine)) { throw "Restarted Receiver did not emit startup status" }
     $restartFields = @{}
