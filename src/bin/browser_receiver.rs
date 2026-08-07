@@ -3,6 +3,11 @@
 //! This binary intentionally compiles only the SQLite/browser-diagnostics
 //! modules and does not link the packet-capture stack. That lets Windows E2E
 //! validate Receiver behavior without requiring the Npcap runtime DLL.
+//!
+//! The shared modules expose APIs used by the main library, GUI, and CLI that
+//! are intentionally unused by this narrow helper crate. Keep the exception
+//! scoped here so `-D warnings` remains strict everywhere else.
+#![allow(dead_code)]
 
 #[path = "../app_storage.rs"]
 mod app_storage;
