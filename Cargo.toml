@@ -1,10 +1,10 @@
 [package]
 name = "win-domain-flow"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
-description = "Windows application and domain traffic monitor with optional browser activity diagnostics"
+description = "Windows application and domain traffic monitor with authenticated browser activity diagnostics"
 repository = "https://github.com/gpanwj-afk/win-domain-flow"
 publish = false
 default-run = "win-domain-flow-gui"
