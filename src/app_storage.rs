@@ -1,6 +1,6 @@
 use crate::model::{
-    ApplicationFlushBatch, TopApplicationRow, TopDomainDetailRow, TopDomainRow, TrafficBreakdown,
-    TrafficTotals, HISTORICAL_APPLICATION, UNKNOWN_APPLICATION, UNKNOWN_DOMAIN,
+    ApplicationFlushBatch, FlushBatch, TopApplicationRow, TopDomainDetailRow, TopDomainRow,
+    TrafficBreakdown, TrafficTotals, HISTORICAL_APPLICATION, UNKNOWN_APPLICATION, UNKNOWN_DOMAIN,
 };
 use crate::storage::{Storage, StorageError};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -74,6 +74,27 @@ CREATE INDEX IF NOT EXISTS idx_application_daily_domain_period
 
 CREATE INDEX IF NOT EXISTS idx_application_detail_period
     ON application_domain_detail_daily(day_start_utc, application, domain);
+";
+
+const DOMAIN_UPSERT_SQL: &str = "
+INSERT INTO domain_daily (
+    day_start_utc,
+    domain,
+    bytes,
+    packets,
+    updated_at_utc
+)
+VALUES (
+    ?1,
+    ?2,
+    ?3,
+    ?4,
+    CAST(strftime('%s','now') AS INTEGER)
+)
+ON CONFLICT(day_start_utc, domain) DO UPDATE SET
+    bytes = domain_daily.bytes + excluded.bytes,
+    packets = domain_daily.packets + excluded.packets,
+    updated_at_utc = CAST(strftime('%s','now') AS INTEGER);
 ";
 
 const UPSERT_SQL: &str = "
@@ -305,6 +326,7 @@ impl ApplicationStorage {
 
         let mut conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
+        preflight_application_schema(&conn)?;
         conn.execute_batch(APP_SCHEMA_SQL)?;
         validate_pragmas(&conn)?;
         migrate_historical_rows(&mut conn)?;
@@ -315,15 +337,33 @@ impl ApplicationStorage {
         &mut self,
         batch: &ApplicationFlushBatch,
     ) -> Result<(), ApplicationStorageError> {
-        if batch.is_empty() {
+        self.upsert_product_batches(&FlushBatch::default(), batch)
+    }
+
+    pub fn upsert_product_batches(
+        &mut self,
+        domain_batch: &FlushBatch,
+        application_batch: &ApplicationFlushBatch,
+    ) -> Result<(), ApplicationStorageError> {
+        if domain_batch.is_empty() && application_batch.is_empty() {
             return Ok(());
         }
 
         let tx = self.conn.transaction()?;
         {
+            let mut domain_statement = tx.prepare(DOMAIN_UPSERT_SQL)?;
+            for row in &domain_batch.rows {
+                domain_statement.execute(params![
+                    row.day_start_utc,
+                    row.domain,
+                    checked_domain_i64(row.counters.bytes, &row.domain)?,
+                    checked_domain_i64(row.counters.packets, &row.domain)?,
+                ])?;
+            }
+
             let mut total_statement = tx.prepare(UPSERT_SQL)?;
             let mut detail_statement = tx.prepare(DETAIL_UPSERT_SQL)?;
-            for row in &batch.rows {
+            for row in &application_batch.rows {
                 let bytes = checked_i64(row.counters.bytes, &row.application, &row.domain)?;
                 let packets = checked_i64(row.counters.packets, &row.application, &row.domain)?;
                 total_statement.execute(params![
@@ -460,24 +500,34 @@ impl ApplicationStorage {
     }
 
     pub fn period_start_utc(&self, period: TrafficPeriod) -> Result<i64, ApplicationStorageError> {
-        let sql = match period {
-            TrafficPeriod::Today => {
-                "SELECT (CAST(strftime('%s','now') AS INTEGER) / 86400) * 86400"
-            }
-            TrafficPeriod::MonthToDate => {
-                "SELECT (CAST(strftime('%s', strftime('%Y-%m-01 00:00:00','now','localtime'), 'utc') AS INTEGER) / 86400) * 86400"
-            }
-            TrafficPeriod::Last7Days => {
-                "SELECT ((CAST(strftime('%s','now') AS INTEGER) / 86400) * 86400) - (6 * 86400)"
-            }
-            TrafficPeriod::Last30Days => {
-                "SELECT ((CAST(strftime('%s','now') AS INTEGER) / 86400) * 86400) - (29 * 86400)"
-            }
-            TrafficPeriod::All => return Ok(0),
-        };
-        self.conn
-            .query_row(sql, [], |row| row.get(0))
-            .map_err(Into::into)
+        let now_utc: i64 = self.conn.query_row(
+            "SELECT CAST(strftime('%s','now') AS INTEGER)",
+            [],
+            |row| row.get(0),
+        )?;
+        self.period_start_utc_at(period, now_utc)
+    }
+
+    fn period_start_utc_at(
+        &self,
+        period: TrafficPeriod,
+        now_utc: i64,
+    ) -> Result<i64, ApplicationStorageError> {
+        let today = now_utc.div_euclid(86_400) * 86_400;
+        match period {
+            TrafficPeriod::Today => Ok(today),
+            TrafficPeriod::MonthToDate => self
+                .conn
+                .query_row(
+                    "SELECT CAST(strftime('%s', ?1, 'unixepoch', 'start of month') AS INTEGER)",
+                    [now_utc],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into),
+            TrafficPeriod::Last7Days => Ok(today.saturating_sub(6 * 86_400)),
+            TrafficPeriod::Last30Days => Ok(today.saturating_sub(29 * 86_400)),
+            TrafficPeriod::All => Ok(0),
+        }
     }
 }
 
@@ -497,26 +547,44 @@ fn validate_pragmas(conn: &Connection) -> Result<(), ApplicationStorageError> {
     Ok(())
 }
 
-fn migrate_historical_rows(conn: &mut Connection) -> Result<(), ApplicationStorageError> {
-    let current: Option<String> = conn
-        .query_row(
-            "SELECT value FROM schema_meta WHERE key = ?1",
-            [APP_SCHEMA_META_KEY],
-            |row| row.get(0),
-        )
-        .optional()?;
+fn read_application_schema_version(
+    conn: &Connection,
+) -> Result<Option<String>, ApplicationStorageError> {
+    conn.query_row(
+        "SELECT value FROM schema_meta WHERE key = ?1",
+        [APP_SCHEMA_META_KEY],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
 
-    match current.as_deref() {
-        Some(APP_SCHEMA_VERSION) => return Ok(()),
-        Some(version_text) => {
-            let version = version_text.parse::<i64>().map_err(|_| {
-                ApplicationStorageError::InvalidSchemaVersion(version_text.to_string())
-            })?;
-            if version != 1 {
-                return Err(ApplicationStorageError::UnsupportedSchemaVersion(version));
-            }
-        }
-        None => {}
+fn validate_application_schema_version(
+    current: Option<&str>,
+) -> Result<(), ApplicationStorageError> {
+    let Some(version_text) = current else {
+        return Ok(());
+    };
+    if version_text == APP_SCHEMA_VERSION || version_text == "1" {
+        return Ok(());
+    }
+    let version = version_text
+        .parse::<i64>()
+        .map_err(|_| ApplicationStorageError::InvalidSchemaVersion(version_text.to_string()))?;
+    Err(ApplicationStorageError::UnsupportedSchemaVersion(version))
+}
+
+fn preflight_application_schema(conn: &Connection) -> Result<(), ApplicationStorageError> {
+    let current = read_application_schema_version(conn)?;
+    validate_application_schema_version(current.as_deref())
+}
+
+fn migrate_historical_rows(conn: &mut Connection) -> Result<(), ApplicationStorageError> {
+    let current = read_application_schema_version(conn)?;
+    validate_application_schema_version(current.as_deref())?;
+
+    if current.as_deref() == Some(APP_SCHEMA_VERSION) {
+        return Ok(());
     }
 
     let should_import_legacy_totals = current.is_none();
@@ -540,6 +608,14 @@ fn migrate_historical_rows(conn: &mut Connection) -> Result<(), ApplicationStora
     )?;
     tx.commit()?;
     Ok(())
+}
+
+fn checked_domain_i64(value: u64, domain: &str) -> Result<i64, ApplicationStorageError> {
+    i64::try_from(value).map_err(|_| {
+        ApplicationStorageError::DomainStorage(StorageError::CounterTooLarge {
+            domain: domain.to_string(),
+        })
+    })
 }
 
 fn checked_i64(
@@ -731,7 +807,6 @@ mod tests {
 
     fn set_application_schema_version(path: &Path, version: &str) {
         let conn = Connection::open(path).unwrap();
-        conn.execute_batch(APP_SCHEMA_SQL).unwrap();
         conn.execute(
             "INSERT INTO schema_meta (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -748,6 +823,17 @@ mod tests {
             |row| row.get(0),
         )
         .unwrap()
+    }
+
+    fn table_exists(path: &Path, table: &str) -> bool {
+        let conn = Connection::open(path).unwrap();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            != 0
     }
 
     #[test]
@@ -832,10 +918,11 @@ mod tests {
     }
 
     #[test]
-    fn newer_application_schema_is_rejected_without_downgrade() {
+    fn newer_application_schema_is_rejected_before_app_schema_mutation() {
         let path = temp_db_path("newer_schema");
         drop(Storage::open(&path).unwrap());
         set_application_schema_version(&path, "3");
+        assert!(!table_exists(&path, "application_domain_daily"));
 
         let error = match ApplicationStorage::open(&path) {
             Ok(_) => panic!("newer application schema should be rejected"),
@@ -846,14 +933,16 @@ mod tests {
             ApplicationStorageError::UnsupportedSchemaVersion(3)
         ));
         assert_eq!(read_application_schema_version(&path), "3");
+        assert!(!table_exists(&path, "application_domain_daily"));
         cleanup(&path);
     }
 
     #[test]
-    fn invalid_application_schema_is_rejected_without_rewrite() {
+    fn invalid_application_schema_is_rejected_before_app_schema_mutation() {
         let path = temp_db_path("invalid_schema");
         drop(Storage::open(&path).unwrap());
         set_application_schema_version(&path, "future");
+        assert!(!table_exists(&path, "application_domain_daily"));
 
         let error = match ApplicationStorage::open(&path) {
             Ok(_) => panic!("invalid application schema should be rejected"),
@@ -864,6 +953,66 @@ mod tests {
             ApplicationStorageError::InvalidSchemaVersion(ref value) if value == "future"
         ));
         assert_eq!(read_application_schema_version(&path), "future");
+        assert!(!table_exists(&path, "application_domain_daily"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn period_boundaries_are_utc_and_deterministic() {
+        let path = temp_db_path("periods");
+        let storage = ApplicationStorage::open(&path).unwrap();
+        let now = 1_786_104_000_i64; // 2026-08-07 12:00:00 UTC
+        assert_eq!(
+            storage.period_start_utc_at(TrafficPeriod::Today, now).unwrap(),
+            1_786_060_800
+        );
+        assert_eq!(
+            storage
+                .period_start_utc_at(TrafficPeriod::MonthToDate, now)
+                .unwrap(),
+            1_785_542_400
+        );
+        assert_eq!(
+            storage
+                .period_start_utc_at(TrafficPeriod::Last7Days, now)
+                .unwrap(),
+            1_785_542_400
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn product_batch_rolls_back_domain_write_if_application_write_fails() {
+        let path = temp_db_path("atomic_rollback");
+        let mut storage = ApplicationStorage::open(&path).unwrap();
+        let domain_batch = FlushBatch {
+            rows: vec![DomainDelta {
+                day_start_utc: 86_400,
+                domain: "example.com".to_string(),
+                counters: Counters {
+                    bytes: 100,
+                    packets: 1,
+                },
+            }],
+        };
+        let application_batch = ApplicationFlushBatch {
+            rows: vec![app_row(u64::MAX, true, TransportProtocol::Tcp)],
+        };
+
+        assert!(storage
+            .upsert_product_batches(&domain_batch, &application_batch)
+            .is_err());
+        drop(storage);
+
+        let conn = Connection::open(&path).unwrap();
+        let domain_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM domain_daily", [], |row| row.get(0))
+            .unwrap();
+        let application_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM application_domain_daily", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(domain_rows, 0);
+        assert_eq!(application_rows, 0);
         cleanup(&path);
     }
 
