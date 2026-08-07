@@ -1,91 +1,442 @@
 name: ci
 
 on:
+  push:
+    branches:
+      - master
+      - "agent/**"
   pull_request:
-    branches: [master]
+    branches:
+      - master
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  repair-popup-e2e:
-    if: github.head_ref == 'agent/v060-reliability-e2e' && github.actor != 'github-actions[bot]'
+  linux-quality:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libpcap-dev \
+            libgl1-mesa-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxrandr-dev
+
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate browser extension identity, syntax, and privacy policy
+        shell: bash
+        run: |
+          node --check browser-extension/service_worker.js
+          node --check browser-extension/popup.js
+          python3 -m py_compile tools/browser_fixture.py tools/query_e2e_db.py
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+
+          manifest = json.loads(Path("browser-extension/manifest.json").read_text())
+          permissions = set(manifest.get("permissions", []))
+          hosts = manifest.get("host_permissions", [])
+          worker = Path("browser-extension/service_worker.js").read_text()
+          rust = Path("src/browser_activity.rs").read_text()
+
+          assert manifest.get("manifest_version") == 3
+          assert manifest.get("version") == "0.6.0"
+          for permission in {"alarms", "debugger", "downloads", "storage", "tabs"}:
+              assert permission in permissions
+          assert "webRequest" not in permissions
+          assert "<all_urls>" not in hosts
+          assert hosts == ["http://127.0.0.1/*"]
+          assert manifest.get("action", {}).get("default_popup") == "popup.html"
+
+          public_key = base64.b64decode(manifest["key"], validate=True)
+          digest = hashlib.sha256(public_key).digest()[:16]
+          derived_id = "".join(
+              chr(ord("a") + (byte >> 4)) + chr(ord("a") + (byte & 0x0F))
+              for byte in digest
+          )
+          match = re.search(r'BROWSER_EXTENSION_ID:\s*&str\s*=\s*"([a-p]{32})"', rust)
+          assert match, "Rust Receiver extension ID constant missing"
+          assert derived_id == match.group(1), (derived_id, match.group(1))
+
+          assert "pendingEventQueue" in worker
+          assert "RETRY_BASE_MS" in worker and "RETRY_MAX_MS" in worker
+          assert "MAX_QUEUE_BYTES" in worker
+          assert "response.json()" in worker
+          assert "accepted !== true" in worker
+          assert "reportChain" in worker
+          assert "revision" in worker
+          assert "redirectResponse" in worker
+          assert "transferredBytes: null" in worker
+          assert "Network.dataReceived" in worker
+          assert "Network.loadingFinished" in worker
+          assert "Network.getResponseBody" not in worker
+          assert Path("browser-extension/README_CN.md").is_file()
+          print(f"stable_extension_id={derived_id}")
+          PY
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Check all targets
+        run: cargo check --all-targets --locked
+
+      - name: Test all targets
+        run: cargo test --all-targets --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Release build
+        run: cargo build --release --locked
+
+      - name: Verify release binaries
+        run: |
+          test -f target/release/win-domain-flow
+          test -f target/release/win-domain-flow-gui
+          test -f target/release/win-domain-flow-browser-receiver
+
+  windows-product:
+    runs-on: windows-latest
+    timeout-minutes: 80
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust 1.88.0 MSVC
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Npcap SDK 1.16
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archive = Join-Path $env:RUNNER_TEMP "npcap-sdk.zip"
+          $root = Join-Path $env:RUNNER_TEMP "npcap-sdk"
+          $url = "https://npcap.com/dist/npcap-sdk-1.16.zip"
+
+          Remove-Item $archive, $root -Recurse -Force -ErrorAction SilentlyContinue
+          $downloaded = $false
+          for ($attempt = 1; $attempt -le 4; $attempt++) {
+            Write-Host "Downloading Npcap SDK, attempt $attempt of 4"
+            Remove-Item $archive -Force -ErrorAction SilentlyContinue
+            & curl.exe `
+              --fail `
+              --location `
+              --retry 5 `
+              --retry-all-errors `
+              --retry-delay 3 `
+              --connect-timeout 20 `
+              --max-time 180 `
+              --output $archive `
+              $url
+
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $archive)) {
+              $size = (Get-Item $archive).Length
+              if ($size -gt 100000) {
+                $downloaded = $true
+                break
+              }
+              Write-Warning "Downloaded archive was unexpectedly small: $size bytes"
+            }
+            Start-Sleep -Seconds (5 * $attempt)
+          }
+          if (-not $downloaded) { throw "Failed to download a valid Npcap SDK archive" }
+
+          Expand-Archive -Path $archive -DestinationPath $root -Force
+          $library = Get-ChildItem $root -Recurse -Filter wpcap.lib |
+            Where-Object { $_.FullName -match "(?i)(x64|amd64)" } |
+            Select-Object -First 1
+          $header = Get-ChildItem $root -Recurse -Filter pcap.h | Select-Object -First 1
+          if (-not $library) { throw "Npcap x64 wpcap.lib not found" }
+          if (-not $header) { throw "Npcap pcap.h not found" }
+
+          "LIB=$($library.DirectoryName);$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "INCLUDE=$($header.DirectoryName);$env:INCLUDE" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Check Windows targets
+        run: cargo check --all-targets --locked --target x86_64-pc-windows-msvc
+
+      - name: Clippy Windows targets
+        run: cargo clippy --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
+
+      - name: Release build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Verify Windows executables
+        shell: pwsh
+        run: |
+          $root = "target\x86_64-pc-windows-msvc\release"
+          if (!(Test-Path "$root\win-domain-flow.exe")) { throw "CLI executable missing" }
+          if (!(Test-Path "$root\win-domain-flow-gui.exe")) { throw "GUI executable missing" }
+          if (!(Test-Path "$root\win-domain-flow-browser-receiver.exe")) { throw "Receiver helper executable missing" }
+
+      - name: Validate PowerShell harness syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path tools\validate-windows.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host $_.Message }
+            throw "PowerShell validation harness contains syntax errors"
+          }
+
+      - name: Install Chrome for Testing
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $metadataUrl = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
+          $metadata = Invoke-RestMethod -Uri $metadataUrl -TimeoutSec 30
+          $stable = $metadata.channels.Stable
+          $download = @($stable.downloads.chrome | Where-Object { $_.platform -eq "win64" })[0]
+          if (-not $download -or -not $download.url) {
+            throw "Chrome for Testing win64 Stable download was not present in official metadata"
+          }
+
+          $archive = Join-Path $env:RUNNER_TEMP "chrome-for-testing.zip"
+          $extractRoot = Join-Path $env:RUNNER_TEMP "chrome-for-testing"
+          # Stage under the real Program Files ACL tree. Chrome's Windows
+          # sandbox AppContainer cannot execute a copied browser from the
+          # hosted runner's private _temp ACL tree.
+          $programRoot = Join-Path $env:ProgramFiles "DomainFlow-CfT-ProgramFiles"
+          $targetDir = Join-Path $programRoot "Google\Chrome\Application"
+          Remove-Item $archive, $extractRoot, $programRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+          $downloaded = $false
+          for ($attempt = 1; $attempt -le 4; $attempt++) {
+            Write-Host "Downloading Chrome for Testing $($stable.version), attempt $attempt of 4"
+            Remove-Item $archive -Force -ErrorAction SilentlyContinue
+            & curl.exe `
+              --fail `
+              --location `
+              --retry 5 `
+              --retry-all-errors `
+              --retry-delay 3 `
+              --connect-timeout 20 `
+              --max-time 300 `
+              --output $archive `
+              $download.url
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $archive)) {
+              $size = (Get-Item $archive).Length
+              if ($size -gt 10000000) {
+                $downloaded = $true
+                break
+              }
+              Write-Warning "Chrome for Testing archive was unexpectedly small: $size bytes"
+            }
+            Start-Sleep -Seconds (5 * $attempt)
+          }
+          if (-not $downloaded) { throw "Failed to download Chrome for Testing" }
+
+          Expand-Archive -Path $archive -DestinationPath $extractRoot -Force
+          $chrome = Get-ChildItem $extractRoot -Recurse -Filter chrome.exe | Select-Object -First 1
+          if (-not $chrome) { throw "Chrome for Testing chrome.exe was not found" }
+          New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+          Copy-Item (Join-Path $chrome.DirectoryName "*") $targetDir -Recurse -Force
+          $stagedChrome = Join-Path $targetDir "chrome.exe"
+          if (!(Test-Path $stagedChrome)) {
+            throw "Chrome for Testing staging failed"
+          }
+
+          # Keep grants read/execute only and scoped to the isolated test
+          # browser. Program Files normally inherits these ACLs; the explicit
+          # grants make the hosted-runner sandbox requirement deterministic.
+          & icacls.exe $programRoot /grant "*S-1-15-2-1:(OI)(CI)RX" /T /C | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "Failed to grant ALL APPLICATION PACKAGES read/execute access" }
+          & icacls.exe $programRoot /grant "*S-1-15-2-2:(OI)(CI)RX" /T /C | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "Failed to grant ALL RESTRICTED APPLICATION PACKAGES read/execute access" }
+
+          "DOMAINFLOW_BROWSER_EXECUTABLE=$stagedChrome" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "DOMAINFLOW_CFT_VERSION=$($stable.version)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Isolated Chrome for Testing browser diagnostics E2E
+        timeout-minutes: 6
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:DOMAINFLOW_BROWSER_EXECUTABLE)) {
+            throw "Chrome for Testing executable path is missing"
+          }
+          Write-Host "Using Chrome for Testing $env:DOMAINFLOW_CFT_VERSION"
+          Write-Host "Browser executable: $env:DOMAINFLOW_BROWSER_EXECUTABLE"
+          $report = Join-Path $env:RUNNER_TEMP "domainflow-browser-e2e"
+          .\tools\validate-windows.ps1 `
+            -BinaryRoot ".\target\x86_64-pc-windows-msvc\release" `
+            -OutputDirectory $report `
+            -CiMode
+
+      - name: Upload browser E2E evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-domain-flow-browser-e2e-evidence
+          if-no-files-found: warn
+          retention-days: 14
+          path: ${{ runner.temp }}/domainflow-browser-e2e/**
+
+      - name: Assemble Windows package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $source = "target\x86_64-pc-windows-msvc\release"
+          $package = "dist\win-domain-flow-windows-x64"
+          Remove-Item $package -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+
+          Copy-Item "$source\win-domain-flow.exe" $package
+          Copy-Item "$source\win-domain-flow-gui.exe" $package
+          Copy-Item "$source\win-domain-flow-browser-receiver.exe" $package
+          Copy-Item README.md, INSTALL.md, INSTALL_CN.md $package
+          Copy-Item browser-extension "$package\browser-extension" -Recurse
+          New-Item -ItemType Directory -Path "$package\tools" -Force | Out-Null
+          Copy-Item tools\validate-windows.ps1 "$package\tools"
+          Copy-Item tools\browser_fixture.py "$package\tools"
+          Copy-Item tools\query_e2e_db.py "$package\tools"
+
+          @'
+          @echo off
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~dp0win-domain-flow-gui.exe' -WorkingDirectory '%~dp0' -Verb RunAs"
+          '@ | Set-Content -Path "$package\Start-GUI-As-Administrator.cmd" -Encoding Ascii
+
+          $required = @(
+            "$package\win-domain-flow.exe",
+            "$package\win-domain-flow-gui.exe",
+            "$package\win-domain-flow-browser-receiver.exe",
+            "$package\README.md",
+            "$package\INSTALL.md",
+            "$package\INSTALL_CN.md",
+            "$package\Start-GUI-As-Administrator.cmd",
+            "$package\browser-extension\manifest.json",
+            "$package\browser-extension\service_worker.js",
+            "$package\browser-extension\popup.html",
+            "$package\browser-extension\popup.js",
+            "$package\browser-extension\README_CN.md",
+            "$package\tools\validate-windows.ps1",
+            "$package\tools\browser_fixture.py",
+            "$package\tools\query_e2e_db.py"
+          )
+          foreach ($item in $required) {
+            if (!(Test-Path $item)) { throw "Package item missing: $item" }
+          }
+
+          $forbidden = @(Get-ChildItem $package -Recurse -Force | Where-Object {
+            $_.Name -match '(?i)\.(pem|key|pfx|p12|db)$' -or
+            $_.Name -match '(?i)(\.db-wal|\.db-shm|validation-report|validation-manifest|edge-profile)'
+          })
+          if ($forbidden.Count -gt 0) {
+            $forbidden | ForEach-Object { Write-Host "Forbidden package item: $($_.FullName)" }
+            throw "Release package contains private, runtime, or validation-only files"
+          }
+
+      - name: Upload Windows x64 package
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-domain-flow-windows-x64
+          if-no-files-found: error
+          retention-days: 14
+          path: dist/win-domain-flow-windows-x64/**
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs:
+      - linux-quality
+      - windows-product
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
+
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout release commit
+        uses: actions/checkout@v6
+
+      - name: Download validated Windows package
+        uses: actions/download-artifact@v8
         with:
-          ref: agent/v060-reliability-e2e
-      - name: Patch validator through popup messaging
-        shell: python
-        run: |
-          from pathlib import Path
-          path=Path('tools/validate-windows.ps1')
-          text=path.read_text(encoding='utf-8')
-          old='''    $serviceDebuggerUrl = Find-CdpTargetDebuggerUrl $BrowserDebugPort ([string]$extensionTarget.target.targetId) 15
-              Assert-Evidence (-not [string]::IsNullOrWhiteSpace($serviceDebuggerUrl)) "Extension Service Worker debugger URL" ([string]$extensionTarget.target.targetId)
-              $ExtensionSocket = Connect-Cdp $serviceDebuggerUrl
-              [void](Send-Cdp $ExtensionSocket "Runtime.enable" @{})
-              $runtimeProbe = Evaluate-Cdp $ExtensionSocket "" "({hasChrome:typeof chrome==='object',hasStorage:typeof chrome==='object' && !!chrome.storage && !!chrome.storage.local})"
-              Assert-Evidence ([bool]$runtimeProbe.hasChrome -and [bool]$runtimeProbe.hasStorage) "Extension Runtime context" ($runtimeProbe | ConvertTo-Json -Compress)
-              $previous = Evaluate-Cdp $ExtensionSocket "" "new Promise(resolve => chrome.storage.local.get({diagnosticsEnabled:false, receiverPort:38765}).then(resolve))"
-              $PreviousDiagnosticsEnabled = [bool]$previous.diagnosticsEnabled
-              $setExpression = "new Promise((resolve,reject)=>chrome.storage.local.set({diagnosticsEnabled:true,receiverPort:$ReceiverPort}).then(()=>resolve(true)).catch(e=>reject(String(e))))"
-              [void](Evaluate-Cdp $ExtensionSocket "" $setExpression)
-              Add-Result "Extension diagnostics enabled" "PASS" "receiverPort=$ReceiverPort"
-          '''
-          new='''    $extensionWorkerUrl = [string]$extensionTarget.target.url
-              if ($extensionWorkerUrl -notmatch '^((?:chrome|edge)-extension://[a-p]{32})/') {
-                  throw "Could not derive packaged extension origin from service worker URL: $extensionWorkerUrl"
-              }
-              $extensionOrigin = [string]$Matches[1]
-              $popupTarget = Send-Cdp $BrowserSocket "Target.createTarget" @{ url = "$extensionOrigin/popup.html" }
-              $OwnedTargets.Add([string]$popupTarget.targetId) | Out-Null
-              $popupDebuggerUrl = Find-CdpTargetDebuggerUrl $BrowserDebugPort ([string]$popupTarget.targetId) 15
-              Assert-Evidence (-not [string]::IsNullOrWhiteSpace($popupDebuggerUrl)) "Extension popup debugger URL" ([string]$popupTarget.targetId)
-              $ExtensionSocket = Connect-Cdp $popupDebuggerUrl
-              [void](Send-Cdp $ExtensionSocket "Runtime.enable" @{})
-              $runtimeProbe = Evaluate-Cdp $ExtensionSocket "" "({hasChrome:typeof chrome==='object',hasRuntime:typeof chrome==='object' && !!chrome.runtime && !!chrome.runtime.sendMessage,hasStorage:typeof chrome==='object' && !!chrome.storage && !!chrome.storage.local})"
-              Assert-Evidence ([bool]$runtimeProbe.hasChrome -and [bool]$runtimeProbe.hasRuntime -and [bool]$runtimeProbe.hasStorage) "Extension popup Runtime context" ($runtimeProbe | ConvertTo-Json -Compress)
-              $previous = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:'diagnostics-health'})"
-              Assert-Evidence ([bool]$previous.ok) "Extension popup Receiver health" ($previous | ConvertTo-Json -Compress)
-              $PreviousDiagnosticsEnabled = [bool]$previous.enabled
-              $portResponse = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:'diagnostics-set-receiver-port',port:$ReceiverPort})"
-              Assert-Evidence ([bool]$portResponse.ok -and [int]$portResponse.receiverPort -eq $ReceiverPort) "Extension Receiver port configured" ($portResponse | ConvertTo-Json -Compress)
-              $enableResponse = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:'diagnostics-set-enabled',enabled:true})"
-              Assert-Evidence ([bool]$enableResponse.ok -and [bool]$enableResponse.enabled) "Extension diagnostics enabled" ($enableResponse | ConvertTo-Json -Compress)
-          '''
-          if old not in text: raise SystemExit('service worker debugger control block not found')
-          text=text.replace(old,new,1)
-          replacements={
-            '$extensionHealth = Evaluate-Cdp $ExtensionSocket "" "({enabled:diagnosticsEnabled,attachedTabs:attachedTabs.size,queueLength:eventQueue.length,lastAttachError,lastReceiverError})"':'$extensionHealth = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:\'diagnostics-health\'})"',
-            '$outageHealth = Evaluate-Cdp $ExtensionSocket "" "({queueLength:eventQueue.length,lastReceiverError})"':'$outageHealth = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:\'diagnostics-health\'})"',
-            '$recoveryHealth = Evaluate-Cdp $ExtensionSocket "" "({queueLength:eventQueue.length,lastReceiverError})"':'$recoveryHealth = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:\'diagnostics-health\'})"',
-          }
-          for a,b in replacements.items():
-              if a not in text: raise SystemExit(f'health expression not found: {a[:40]}')
-              text=text.replace(a,b,1)
-          old_line='[void](Evaluate-Cdp $ExtensionSocket "" "chrome.storage.local.set({diagnosticsEnabled:$restoreValue}).then(()=>true)")'
-          new_lines='''$restorePort = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:'diagnostics-set-receiver-port',port:38765})"
-              $restoreEnabled = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:'diagnostics-set-enabled',enabled:$restoreValue})"
-              if (-not [bool]$restorePort.ok -or -not [bool]$restoreEnabled.ok) { throw "Extension settings restore was rejected" }'''
-          if old_line not in text: raise SystemExit('restore storage line not found')
-          text=text.replace(old_line,new_lines,1)
-          old_add='Add-Result "Extension diagnostics setting restored" "PASS" "diagnosticsEnabled=$restoreValue"'
-          if old_add not in text: raise SystemExit('restore result line not found')
-          text=text.replace(old_add,'Add-Result "Extension diagnostics setting restored" "PASS" "diagnosticsEnabled=$restoreValue; receiverPort=38765"',1)
-          for needle in ['Extension popup debugger URL','Extension popup Runtime context',"chrome.runtime.sendMessage({type:'diagnostics-health'})",'diagnostics-set-receiver-port','diagnostics-set-enabled']:
-              if needle not in text: raise SystemExit(f'missing patched marker: {needle}')
-          if 'Extension Service Worker debugger URL' in text: raise SystemExit('obsolete debugger gate remains')
-          path.write_text(text,encoding='utf-8')
-      - name: Commit validator patch
+          name: win-domain-flow-windows-x64
+          path: dist/win-domain-flow-windows-x64
+
+      - name: Prepare release assets
+        id: release_meta
         shell: bash
         run: |
           set -euo pipefail
-          git add tools/validate-windows.ps1
-          git diff --cached --check
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "Validate extension through popup messaging"
-          git push origin HEAD:agent/v060-reliability-e2e
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          tag="v$version"
+          archive="win-domain-flow-${tag}-windows-x64.zip"
+          test -f dist/win-domain-flow-windows-x64/win-domain-flow-gui.exe
+          test -f dist/win-domain-flow-windows-x64/browser-extension/manifest.json
+          (cd dist && zip -q -r "../$archive" win-domain-flow-windows-x64)
+          sha256sum "$archive" > "$archive.sha256"
+          cat > RELEASE_NOTES.md <<EOF
+          ## win-domain-flow $tag
+
+          Windows x64 stable release built from commit \`$GITHUB_SHA\`.
+
+          Release gates completed before publication:
+          - Rust 1.88 format, check, tests, Clippy with \`-D warnings\`, and release build
+          - Windows MSVC check, Clippy, and release build against Npcap SDK 1.16
+          - isolated Chrome for Testing extension E2E using a temporary profile and SQLite database
+          - Receiver outage queueing and automatic replay after Receiver recovery
+          - release-package content and forbidden-file scan
+
+          Extract the ZIP and run \`Start-GUI-As-Administrator.cmd\`. Npcap must be installed for live packet capture.
+          EOF
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Publish immutable GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release_meta.outputs.tag }}
+          ARCHIVE: ${{ steps.release_meta.outputs.archive }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; refusing to overwrite an existing stable release."
+            exit 0
+          fi
+          gh release create "$TAG" \
+            "$ARCHIVE" \
+            "$ARCHIVE.sha256" \
+            --target "$GITHUB_SHA" \
+            --title "win-domain-flow $TAG" \
+            --notes-file RELEASE_NOTES.md \
+            --latest
