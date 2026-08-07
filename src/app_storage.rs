@@ -500,11 +500,11 @@ impl ApplicationStorage {
     }
 
     pub fn period_start_utc(&self, period: TrafficPeriod) -> Result<i64, ApplicationStorageError> {
-        let now_utc: i64 = self.conn.query_row(
-            "SELECT CAST(strftime('%s','now') AS INTEGER)",
-            [],
-            |row| row.get(0),
-        )?;
+        let now_utc: i64 =
+            self.conn
+                .query_row("SELECT CAST(strftime('%s','now') AS INTEGER)", [], |row| {
+                    row.get(0)
+                })?;
         self.period_start_utc_at(period, now_utc)
     }
 
@@ -963,7 +963,9 @@ mod tests {
         let storage = ApplicationStorage::open(&path).unwrap();
         let now = 1_786_104_000_i64; // 2026-08-07 12:00:00 UTC
         assert_eq!(
-            storage.period_start_utc_at(TrafficPeriod::Today, now).unwrap(),
+            storage
+                .period_start_utc_at(TrafficPeriod::Today, now)
+                .unwrap(),
             1_786_060_800
         );
         assert_eq!(
@@ -1009,7 +1011,9 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM domain_daily", [], |row| row.get(0))
             .unwrap();
         let application_rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM application_domain_daily", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM application_domain_daily", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(domain_rows, 0);
         assert_eq!(application_rows, 0);

@@ -60,9 +60,8 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let database = absolute_database_path(
-        database.ok_or_else(|| anyhow::anyhow!("--db is required"))?,
-    )?;
+    let database =
+        absolute_database_path(database.ok_or_else(|| anyhow::anyhow!("--db is required"))?)?;
     let server = BrowserActivityServer::spawn_on(database, port)?;
     let status = server.status();
     println!(
