@@ -10,7 +10,7 @@ Windows 本机应用、域名与浏览器活动诊断工具。
 
 扩展现在使用持久化有界发送队列：
 
-- 最多保存 1000 条待发送事件
+- 最多保存 1000 条待发送事件，同时将序列化队列控制在约 4 MiB 以内
 - 队列保存在 `chrome.storage.local`
 - Receiver 不可用时指数退避重试
 - 使用 `chrome.alarms` 支持 Manifest V3 Service Worker 被挂起后的恢复补发
@@ -68,7 +68,7 @@ GUI 启动前会探测现有 `win-domain-flow` Receiver。若已有实例运行�
 
 GUI 会明确显示实际使用的绝对路径。
 
-若用户没有保存过明确数据库路径，但旧工作目录存在 `domainflow.db`，程序会使用 SQLite online backup API 将旧库复制到固定数据目录：
+若旧版使用的是程序自动选择的工作目录 `domainflow.db`，0.6 会识别这一精确旧默认路径，即使旧版已经把它保存进 `settings.conf`，仍会使用 SQLite online backup API 将旧库复制到固定数据目录。真正由用户手工指定的自定义数据库路径不会被自动迁移：
 
 - 读取源库时不执行 WAL checkpoint
 - 已提交但仍在 WAL 中的数据也会进入快照
@@ -187,7 +187,8 @@ tools\query_e2e_db.py
 - 独立临时 SQLite，不写用户真实数据库
 - 本机 fixture 只绑定 `127.0.0.1`，不依赖公网
 - 使用 CDP `Target.createTarget` 创建测试页，不用 `Start-Process msedge.exe URL`
-- 从 Service Worker URL 动态发现实际扩展 ID，不依赖历史 ID
+- 从 Service Worker URL 动态发现实际扩展 ID，并与 Receiver 期望的发行 ID 严格核对
+- CDP connect/send/receive 均有硬超时，浏览器异常不会无限挂住验证器
 - 只停止命令行包含本次临时 Profile 的浏览器 PID
 - Receiver 停止失败时不会启动第二个 Receiver
 - 使用 SQLite `mode=ro` 查询，不看 DB 文件时间，不执行 checkpoint
@@ -195,7 +196,9 @@ tools\query_e2e_db.py
 - 测试结束恢复扩展诊断开关
 - 输出 JSON、JUnit XML 和测试 manifest
 
-manifest 包含 commit、二进制 SHA-256、Receiver PID/端口、浏览器 PID、临时 Profile、动态扩展 ID和临时数据库路径。
+CI 使用官方 Chrome for Testing 执行自动化扩展 E2E；用户正常使用仍按上文在 Edge/Chrome 扩展管理页手工加载发行包中的扩展。
+
+manifest 包含 commit、二进制 SHA-256、Receiver PID/端口、浏览器 PID、临时 Profile、动态扩展 ID 和临时数据库路径。
 
 ## CLI 的隔离 Receiver 模式
 
@@ -298,9 +301,9 @@ GitHub Actions 额外执行：
 - Receiver 真 TCP 集成测试
 - SQLite WAL online-backup 回归测试
 - Windows MSVC / Npcap SDK 构建
-- Windows dedicated-profile 浏览器端到端测试
+- Windows Chrome for Testing dedicated-profile 浏览器端到端测试
 - Receiver 停机队列自动补发测试
-- Windows 成品包验收
+- Windows 成品包验收与敏感/临时文件扫描
 
 ## 许可证
 
