@@ -15,7 +15,7 @@ permissions:
 jobs:
   linux-quality:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -42,31 +42,55 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Validate browser extension syntax and policy
+      - name: Validate browser extension identity, syntax, and privacy policy
         shell: bash
         run: |
           node --check browser-extension/service_worker.js
           node --check browser-extension/popup.js
+          python3 -m py_compile tools/browser_fixture.py tools/query_e2e_db.py
           python3 - <<'PY'
+          import base64
+          import hashlib
           import json
+          import re
           from pathlib import Path
 
           manifest = json.loads(Path("browser-extension/manifest.json").read_text())
           permissions = set(manifest.get("permissions", []))
           hosts = manifest.get("host_permissions", [])
           worker = Path("browser-extension/service_worker.js").read_text()
+          rust = Path("src/browser_activity.rs").read_text()
 
           assert manifest.get("manifest_version") == 3
-          assert "debugger" in permissions
-          assert "downloads" in permissions
+          assert manifest.get("version") == "0.6.0"
+          for permission in {"alarms", "debugger", "downloads", "storage", "tabs"}:
+              assert permission in permissions
           assert "webRequest" not in permissions
           assert "<all_urls>" not in hosts
-          assert hosts == ["http://127.0.0.1:38765/*"]
+          assert hosts == ["http://127.0.0.1/*"]
+
+          public_key = base64.b64decode(manifest["key"], validate=True)
+          digest = hashlib.sha256(public_key).digest()[:16]
+          derived_id = "".join(
+              chr(ord("a") + (byte >> 4)) + chr(ord("a") + (byte & 0x0F))
+              for byte in digest
+          )
+          match = re.search(r'BROWSER_EXTENSION_ID:\s*&str\s*=\s*"([a-p]{32})"', rust)
+          assert match, "Rust Receiver extension ID constant missing"
+          assert derived_id == match.group(1), (derived_id, match.group(1))
+
+          assert "pendingEventQueue" in worker
+          assert "RETRY_BASE_MS" in worker and "RETRY_MAX_MS" in worker
+          assert "response.json()" in worker
+          assert "accepted !== true" in worker
+          assert "reportChain" in worker
+          assert "redirectResponse" in worker
+          assert "transferredBytes: null" in worker
           assert "Network.dataReceived" in worker
           assert "Network.loadingFinished" in worker
           assert "Network.getResponseBody" not in worker
-          assert "127.0.0.1:38765" in worker
           assert Path("browser-extension/README_CN.md").is_file()
+          print(f"stable_extension_id={derived_id}")
           PY
 
       - name: Format
@@ -91,7 +115,7 @@ jobs:
 
   windows-product:
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 65
 
     steps:
       - name: Checkout
@@ -169,6 +193,39 @@ jobs:
           if (!(Test-Path "$root\win-domain-flow.exe")) { throw "CLI executable missing" }
           if (!(Test-Path "$root\win-domain-flow-gui.exe")) { throw "GUI executable missing" }
 
+      - name: Validate PowerShell harness syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path tools\validate-windows.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host $_.Message }
+            throw "PowerShell validation harness contains syntax errors"
+          }
+
+      - name: Isolated Edge/Chrome browser diagnostics E2E
+        shell: pwsh
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP "domainflow-browser-e2e"
+          .\tools\validate-windows.ps1 `
+            -BinaryRoot ".\target\x86_64-pc-windows-msvc\release" `
+            -OutputDirectory $report `
+            -CiMode
+
+      - name: Upload browser E2E evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-domain-flow-browser-e2e-evidence
+          if-no-files-found: warn
+          retention-days: 14
+          path: ${{ runner.temp }}/domainflow-browser-e2e/**
+
       - name: Assemble Windows package
         shell: pwsh
         run: |
@@ -182,6 +239,10 @@ jobs:
           Copy-Item "$source\win-domain-flow-gui.exe" $package
           Copy-Item README.md, INSTALL.md, INSTALL_CN.md $package
           Copy-Item browser-extension "$package\browser-extension" -Recurse
+          New-Item -ItemType Directory -Path "$package\tools" -Force | Out-Null
+          Copy-Item tools\validate-windows.ps1 "$package\tools"
+          Copy-Item tools\browser_fixture.py "$package\tools"
+          Copy-Item tools\query_e2e_db.py "$package\tools"
 
           @'
           @echo off
@@ -199,7 +260,10 @@ jobs:
             "$package\browser-extension\service_worker.js",
             "$package\browser-extension\popup.html",
             "$package\browser-extension\popup.js",
-            "$package\browser-extension\README_CN.md"
+            "$package\browser-extension\README_CN.md",
+            "$package\tools\validate-windows.ps1",
+            "$package\tools\browser_fixture.py",
+            "$package\tools\query_e2e_db.py"
           )
           foreach ($item in $required) {
             if (!(Test-Path $item)) { throw "Package item missing: $item" }
