@@ -20,39 +20,54 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: agent/v060-reliability-e2e
-      - name: Query master CI and release
+          ref: agent/v060-release-diagnostic
+      - name: Query compact master CI and release metadata
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           MERGE_SHA: 66c43af4a96857b2200af6a3f8d29eb518a382f5
         run: |
           set -euo pipefail
-          matching_runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${MERGE_SHA}&event=push&per_page=100")"
-          recent_master_runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?branch=master&event=push&per_page=10")"
-          master_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/master")"
-          if release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/v0.6.0" 2>/dev/null)"; then
-            release_exists=true
+
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${MERGE_SHA}&event=push&per_page=20" \
+            --jq '[.workflow_runs[] | {id,name,event,status,conclusion,run_number,head_sha,head_branch,html_url,created_at,updated_at,jobs_url}]' \
+            > matching-runs.json
+
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs?branch=master&event=push&per_page=5" \
+            --jq '[.workflow_runs[] | {id,name,event,status,conclusion,run_number,head_sha,head_branch,html_url,created_at,updated_at,jobs_url}]' \
+            > recent-master-runs.json
+
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/master" \
+            --jq '{ref,sha:.object.sha,url:.object.url}' \
+            > master-ref.json
+
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/v0.6.0" \
+            --jq '{id,tag_name,name,draft,prerelease,published_at,created_at,target_commitish,html_url,assets:[.assets[] | {id,name,size,state,digest,created_at,updated_at,browser_download_url}]}' \
+            > release.json 2>/dev/null; then
+            printf 'true\n' > release-exists.json
           else
-            release_exists=false
-            release='null'
+            printf 'null\n' > release.json
+            printf 'false\n' > release-exists.json
           fi
+
           jq -n \
             --arg merge_sha "$MERGE_SHA" \
-            --argjson matching_runs "$matching_runs" \
-            --argjson recent_master_runs "$recent_master_runs" \
-            --argjson master_ref "$master_ref" \
-            --argjson release_exists "$release_exists" \
-            --argjson release "$release" \
-            '{queried_merge_sha:$merge_sha,matching_runs:$matching_runs,recent_master_runs:$recent_master_runs,master_ref:$master_ref,release_exists:$release_exists,release:$release}' \
+            --slurpfile matching matching-runs.json \
+            --slurpfile recent recent-master-runs.json \
+            --slurpfile master_ref master-ref.json \
+            --slurpfile release_exists release-exists.json \
+            --slurpfile release release.json \
+            '{queried_merge_sha:$merge_sha,matching_runs:$matching[0],recent_master_runs:$recent[0],master_ref:$master_ref[0],release_exists:$release_exists[0],release:$release[0]}' \
             > master-release-diagnostic.json
+
           cat master-release-diagnostic.json
       - name: Persist diagnostic JSON
         shell: bash
         run: |
           set -euo pipefail
           git add master-release-diagnostic.json
+          git diff --cached --check
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "Record master release diagnostic"
-          git push origin HEAD:agent/v060-reliability-e2e
+          git push origin HEAD:agent/v060-release-diagnostic
