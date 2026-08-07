@@ -84,6 +84,7 @@ jobs:
           assert "response.json()" in worker
           assert "accepted !== true" in worker
           assert "reportChain" in worker
+          assert "revision" in worker
           assert "redirectResponse" in worker
           assert "transferredBytes: null" in worker
           assert "Network.dataReceived" in worker
@@ -112,10 +113,11 @@ jobs:
         run: |
           test -f target/release/win-domain-flow
           test -f target/release/win-domain-flow-gui
+          test -f target/release/win-domain-flow-browser-receiver
 
   windows-product:
     runs-on: windows-latest
-    timeout-minutes: 65
+    timeout-minutes: 70
 
     steps:
       - name: Checkout
@@ -192,6 +194,7 @@ jobs:
           $root = "target\x86_64-pc-windows-msvc\release"
           if (!(Test-Path "$root\win-domain-flow.exe")) { throw "CLI executable missing" }
           if (!(Test-Path "$root\win-domain-flow-gui.exe")) { throw "GUI executable missing" }
+          if (!(Test-Path "$root\win-domain-flow-browser-receiver.exe")) { throw "Receiver helper executable missing" }
 
       - name: Validate PowerShell harness syntax
         shell: pwsh
@@ -237,6 +240,7 @@ jobs:
 
           Copy-Item "$source\win-domain-flow.exe" $package
           Copy-Item "$source\win-domain-flow-gui.exe" $package
+          Copy-Item "$source\win-domain-flow-browser-receiver.exe" $package
           Copy-Item README.md, INSTALL.md, INSTALL_CN.md $package
           Copy-Item browser-extension "$package\browser-extension" -Recurse
           New-Item -ItemType Directory -Path "$package\tools" -Force | Out-Null
@@ -252,6 +256,7 @@ jobs:
           $required = @(
             "$package\win-domain-flow.exe",
             "$package\win-domain-flow-gui.exe",
+            "$package\win-domain-flow-browser-receiver.exe",
             "$package\README.md",
             "$package\INSTALL.md",
             "$package\INSTALL_CN.md",
