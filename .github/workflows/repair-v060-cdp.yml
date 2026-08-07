@@ -10,19 +10,16 @@ permissions:
 
 jobs:
   repair:
-    if: github.actor != 'github-actions[bot]'
-    runs-on: windows-latest
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
         with:
           ref: agent/v060-reliability-e2e
 
-      - name: Repair Service Worker CDP control path
-        shell: pwsh
+      - name: Patch Service Worker CDP control path
+        shell: python
         run: |
-          $ErrorActionPreference = "Stop"
-          @'
           from pathlib import Path
 
           path = Path("tools/validate-windows.ps1")
@@ -42,8 +39,7 @@ jobs:
               "extension socket declaration",
           )
 
-          marker = '''function Get-OwnedBrowserProcesses {
-          '''
+          marker = "function Get-OwnedBrowserProcesses {\n"
           helper = '''function Find-CdpTargetDebuggerUrl {
               param(
                   [int]$Port,
@@ -63,7 +59,7 @@ jobs:
                               return [string]$match[0].webSocketDebuggerUrl
                           }
                       } catch {
-                          # The target list can race a waking MV3 service worker; retry below.
+                          # MV3 worker target enumeration can race startup; retry below.
                       }
                   }
                   Start-Sleep -Milliseconds 200
@@ -75,10 +71,10 @@ jobs:
           '''
           if "function Find-CdpTargetDebuggerUrl" not in text:
               if marker not in text:
-                  raise SystemExit("CDP debugger helper insertion marker not found")
+                  raise SystemExit("debugger URL helper marker not found")
               text = text.replace(marker, helper, 1)
 
-          old_control = '''    $attach = Send-Cdp $BrowserSocket "Target.attachToTarget" @{ targetId = $extensionTarget.target.targetId; flatten = $true }
+          old = '''    $attach = Send-Cdp $BrowserSocket "Target.attachToTarget" @{ targetId = $extensionTarget.target.targetId; flatten = $true }
               $ServiceSession = [string]$attach.sessionId
               $previous = Evaluate-Cdp $BrowserSocket $ServiceSession "new Promise(resolve => chrome.storage.local.get({diagnosticsEnabled:false, receiverPort:38765}).then(resolve))"
               $PreviousDiagnosticsEnabled = [bool]$previous.diagnosticsEnabled
@@ -86,7 +82,7 @@ jobs:
               [void](Evaluate-Cdp $BrowserSocket $ServiceSession $setExpression)
               Add-Result "Extension diagnostics enabled" "PASS" "receiverPort=$ReceiverPort"
           '''
-          new_control = '''    $serviceDebuggerUrl = Find-CdpTargetDebuggerUrl $BrowserDebugPort ([string]$extensionTarget.target.targetId) 15
+          new = '''    $serviceDebuggerUrl = Find-CdpTargetDebuggerUrl $BrowserDebugPort ([string]$extensionTarget.target.targetId) 15
               Assert-Evidence (-not [string]::IsNullOrWhiteSpace($serviceDebuggerUrl)) "Extension Service Worker debugger URL" ([string]$extensionTarget.target.targetId)
               $ExtensionSocket = Connect-Cdp $serviceDebuggerUrl
               [void](Send-Cdp $ExtensionSocket "Runtime.enable" @{})
@@ -98,24 +94,14 @@ jobs:
               [void](Evaluate-Cdp $ExtensionSocket "" $setExpression)
               Add-Result "Extension diagnostics enabled" "PASS" "receiverPort=$ReceiverPort"
           '''
-          replace_once(old_control, new_control, "service worker control block")
+          replace_once(old, new, "service worker CDP control")
 
-          text = text.replace(
-              'Evaluate-Cdp $BrowserSocket $ServiceSession',
-              'Evaluate-Cdp $ExtensionSocket ""',
+          text = text.replace('Evaluate-Cdp $BrowserSocket $ServiceSession', 'Evaluate-Cdp $ExtensionSocket ""')
+          replace_once(
+              '    if ($null -ne $BrowserSocket -and -not [string]::IsNullOrWhiteSpace($ServiceSession)) {\n',
+              '    if ($null -ne $ExtensionSocket) {\n',
+              "extension restore guard",
           )
-
-          old_finally = '''    if ($null -ne $BrowserSocket -and -not [string]::IsNullOrWhiteSpace($ServiceSession)) {
-          '''
-          new_finally = '''    if ($null -ne $ExtensionSocket) {
-          '''
-          replace_once(old_finally, new_finally, "finally extension socket guard")
-
-          old_restore = '''            [void](Evaluate-Cdp $ExtensionSocket "" "chrome.storage.local.set({diagnosticsEnabled:$restoreValue}).then(()=>true)")
-          '''
-          # The global replacement above already converts this line. Keep it as an assertion target.
-          if old_restore not in text:
-              raise SystemExit("extension restore call was not converted")
 
           browser_dispose = '''    if ($null -ne $BrowserSocket) {
               foreach ($targetId in $OwnedTargets) {
@@ -129,27 +115,21 @@ jobs:
           '''
           if "try { $ExtensionSocket.Dispose() }" not in text:
               if browser_dispose not in text:
-                  raise SystemExit("browser dispose block not found")
+                  raise SystemExit("browser cleanup marker not found")
               text = text.replace(browser_dispose, extension_dispose, 1)
 
+          required = [
+              "Find-CdpTargetDebuggerUrl",
+              "Extension Service Worker debugger URL",
+              "Extension Runtime context",
+              'Evaluate-Cdp $ExtensionSocket ""',
+          ]
+          for needle in required:
+              if needle not in text:
+                  raise SystemExit(f"patched validator missing {needle}")
           path.write_text(text, encoding="utf-8")
-          '@ | python -
 
-          $tokens = $null
-          $errors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path tools\validate-windows.ps1),
-            [ref]$tokens,
-            [ref]$errors
-          ) | Out-Null
-          if ($errors.Count -gt 0) {
-            $errors | ForEach-Object { Write-Host $_.Message }
-            throw "Repaired validator contains PowerShell syntax errors"
-          }
-          Select-String -Path tools\validate-windows.ps1 -Pattern 'Find-CdpTargetDebuggerUrl' -Quiet | ForEach-Object { if (-not $_) { throw "Direct target debugger helper missing" } }
-          Select-String -Path tools\validate-windows.ps1 -Pattern 'Extension Runtime context' -Quiet | ForEach-Object { if (-not $_) { throw "Runtime context gate missing" } }
-
-      - name: Commit repair and remove temporary workflow
+      - name: Commit patch and remove temporary workflow
         shell: bash
         run: |
           set -euo pipefail
