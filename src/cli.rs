@@ -143,6 +143,7 @@ pub fn run_with_writer<W: Write>(cli: Cli, out: &mut W) -> anyhow::Result<()> {
             if port != 0 && !(1024..=65535).contains(&port) {
                 anyhow::bail!("--port must be 0 or in 1024..=65535");
             }
+            let db = absolute_database_path(db)?;
             let server = BrowserActivityServer::spawn_on(db, port)
                 .map_err(|error| anyhow::anyhow!(error))?;
             let status = server.status();
@@ -183,6 +184,14 @@ pub fn render_top_rows<W: Write>(
         )?;
     }
     Ok(())
+}
+
+fn absolute_database_path(path: PathBuf) -> anyhow::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
 }
 
 fn sanitize_tsv(s: &str) -> String {
@@ -226,6 +235,15 @@ mod tests {
             }
             _ => panic!("expected BrowserReceiver command"),
         }
+    }
+
+    #[test]
+    fn relative_receiver_database_path_becomes_absolute() {
+        let current = std::env::current_dir().unwrap();
+        assert_eq!(
+            absolute_database_path(PathBuf::from("test.db")).unwrap(),
+            current.join("test.db")
+        );
     }
 
     #[test]
