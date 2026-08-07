@@ -1,0 +1,48 @@
+name: v060-validator-patch
+
+on:
+  push:
+    branches:
+      - agent/v060-reliability-e2e
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/v060-reliability-e2e
+          fetch-depth: 0
+      - name: Apply validator patch
+        run: python3 tools/patch_v060_validator.py
+      - name: Sanity check validator source
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path tools/validate-windows.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            throw "PowerShell syntax errors found"
+          }
+      - name: Commit validator
+        shell: bash
+        run: |
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tools/validate-windows.ps1
+          git commit -m "verify queued browser events replay after receiver recovery"
+          git pull --rebase origin agent/v060-reliability-e2e
+          git push origin HEAD:agent/v060-reliability-e2e
