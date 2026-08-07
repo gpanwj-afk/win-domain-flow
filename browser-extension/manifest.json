@@ -1,9 +1,10 @@
 {
   "manifest_version": 3,
   "name": "域流量管家 · 浏览器活动诊断",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "在用户启用后记录网页请求的实际传输字节、URL、资源类型和浏览器下载记录，不读取 HTTPS 正文。",
   "minimum_chrome_version": "109",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAjmd/q9Eqmq6fjHDkk0jIBs0oYkMFYIw5CRoACxHBV5SkRcsFg0nDw0Abmmtnp0j71mfjC3RzlriFUV17eNod+NLZqli2cNo0m60a6GHSeibzRKMS/mHTk7BaCgdUaQKylLuSANvIDYKdvxemFau55t3p/nz198ELXDXCbuOH2fN8kamA3Q/+dPsHVQmlJ7vfMNcUTLyxPZjrA/70Bouf0zzOfu5j1X/8klRM15CHA3gbXF0RveanX9HAxItPpE+uK3D/bSo/Ze+lEAtdp6lLp9J9SHwFjiCuuVyKHFx6ti6oaSehERFcnCYlHsnoFkuRmdHHbkZnWmREwIyV7PC55wIDAQAB",
   "permissions": [
     "debugger",
     "downloads",
@@ -11,7 +12,7 @@
     "tabs"
   ],
   "host_permissions": [
-    "http://127.0.0.1:38765/*"
+    "http://127.0.0.1/*"
   ],
   "background": {
     "service_worker": "service_worker.js"
