@@ -250,9 +250,16 @@ async function processQueue() {
         break;
       }
 
+      const revision = Number(entry.revision) || 0;
+      const payload = entry.payload;
       try {
-        await deliverEvent(entry.payload);
-        eventQueue.shift();
+        await deliverEvent(payload);
+        if (eventQueue[0] === entry && (Number(entry.revision) || 0) === revision) {
+          eventQueue.shift();
+        } else {
+          entry.attempts = 0;
+          entry.nextAttemptAt = 0;
+        }
         lastReceiverError = null;
         await persistQueue();
       } catch (error) {
@@ -284,6 +291,7 @@ async function enqueueEvent(payload) {
   );
   if (existingIndex >= 0) {
     eventQueue[existingIndex].payload = mergePayload(eventQueue[existingIndex].payload, payload);
+    eventQueue[existingIndex].revision = (Number(eventQueue[existingIndex].revision) || 0) + 1;
     eventQueue[existingIndex].attempts = 0;
     eventQueue[existingIndex].nextAttemptAt = 0;
   } else {
@@ -292,7 +300,7 @@ async function enqueueEvent(payload) {
       droppedEventCount += 1;
       lastReceiverError = `发送队列已满，已丢弃最旧事件（累计 ${droppedEventCount} 条）`;
     }
-    eventQueue.push({ payload, attempts: 0, nextAttemptAt: 0 });
+    eventQueue.push({ payload, attempts: 0, nextAttemptAt: 0, revision: 0 });
   }
   await persistQueue();
   processQueue();
@@ -665,7 +673,15 @@ async function initialize() {
   receiverPort = validPort(values.receiverPort);
   droppedEventCount = positiveInteger(values.droppedEventCount) || 0;
   eventQueue = Array.isArray(values[QUEUE_STORAGE_KEY])
-    ? values[QUEUE_STORAGE_KEY].filter((entry) => entry && entry.payload && entry.payload.eventId).slice(-MAX_QUEUE_LENGTH)
+    ? values[QUEUE_STORAGE_KEY]
+        .filter((entry) => entry && entry.payload && entry.payload.eventId)
+        .slice(-MAX_QUEUE_LENGTH)
+        .map((entry) => ({
+          ...entry,
+          revision: Number(entry.revision) || 0,
+          attempts: Math.max(0, Number(entry.attempts) || 0),
+          nextAttemptAt: Math.max(0, Number(entry.nextAttemptAt) || 0)
+        }))
     : [];
   processQueue();
   if (diagnosticsEnabled) await attachAllTabs();
