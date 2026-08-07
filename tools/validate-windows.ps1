@@ -123,13 +123,13 @@ function Get-Python {
 }
 
 function Get-BrowserExecutable {
-    $candidates = @(
+    $candidates = @(@(
         "$env:ProgramFiles(x86)\Microsoft\Edge\Application\msedge.exe",
         "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
         "$env:LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe",
         "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
         "$env:ProgramFiles(x86)\Google\Chrome\Application\chrome.exe"
-    ) | Where-Object { $_ -and (Test-Path $_) }
+    ) | Where-Object { $_ -and (Test-Path $_) })
     if ($candidates.Count -eq 0) { throw "Edge/Chrome executable was not found" }
     return [IO.Path]::GetFullPath($candidates[0])
 }
