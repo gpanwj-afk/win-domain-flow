@@ -1,8 +1,8 @@
 use crate::app_storage::{ApplicationStorage, TrafficPeriod};
 use rusqlite::{params, Connection};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub const BROWSER_DIAGNOSTICS_PORT: u16 = 38_765;
+pub const BROWSER_EXTENSION_ID: &str = "djfbcmjdmiligkpnejdipgnklmpgmaoj";
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
@@ -77,6 +78,9 @@ pub enum BrowserActivityError {
 
     #[error("browser diagnostics protocol error: {0}")]
     Protocol(&'static str),
+
+    #[error("browser diagnostics port {port} is already in use")]
+    PortInUse { port: u16 },
 
     #[error("browser diagnostics thread panicked")]
     ThreadPanicked,
@@ -243,18 +247,27 @@ impl BrowserActivityStorage {
             occurred_at_ms = excluded.occurred_at_ms,
             host = excluded.host,
             url = excluded.url,
-            page_url = excluded.page_url,
-            initiator = excluded.initiator,
-            method = excluded.method,
-            resource_type = excluded.resource_type,
-            status_code = excluded.status_code,
-            mime = excluded.mime,
+            page_url = COALESCE(excluded.page_url, browser_request_event.page_url),
+            initiator = COALESCE(excluded.initiator, browser_request_event.initiator),
+            method = COALESCE(excluded.method, browser_request_event.method),
+            resource_type = COALESCE(excluded.resource_type, browser_request_event.resource_type),
+            status_code = COALESCE(excluded.status_code, browser_request_event.status_code),
+            mime = COALESCE(excluded.mime, browser_request_event.mime),
             declared_bytes = COALESCE(excluded.declared_bytes, browser_request_event.declared_bytes),
-            transferred_bytes = COALESCE(excluded.transferred_bytes, browser_request_event.transferred_bytes),
+            transferred_bytes = CASE
+                WHEN excluded.transferred_bytes IS NULL THEN browser_request_event.transferred_bytes
+                WHEN browser_request_event.transferred_bytes IS NULL THEN excluded.transferred_bytes
+                WHEN excluded.transferred_bytes > browser_request_event.transferred_bytes THEN excluded.transferred_bytes
+                ELSE browser_request_event.transferred_bytes
+            END,
             protocol = COALESCE(excluded.protocol, browser_request_event.protocol),
-            from_cache = COALESCE(excluded.from_cache, browser_request_event.from_cache),
+            from_cache = CASE
+                WHEN COALESCE(excluded.from_cache, 0) <> 0
+                  OR COALESCE(browser_request_event.from_cache, 0) <> 0 THEN 1
+                ELSE 0
+            END,
             content_disposition = COALESCE(excluded.content_disposition, browser_request_event.content_disposition),
-            error_text = excluded.error_text"#,
+            error_text = COALESCE(excluded.error_text, browser_request_event.error_text)"#,
         params![
             payload.event_id,
             payload.timestamp_ms,
@@ -453,12 +466,17 @@ impl BrowserActivityStorage {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrowserServerStatus {
+    pub product: String,
+    pub pid: u32,
+    pub port: u16,
+    pub database_path: String,
     pub listening: bool,
     pub accepted_events: u64,
     pub last_event_ms: Option<u64>,
     pub last_error: Option<String>,
+    pub expected_extension_id: String,
 }
 
 pub struct BrowserActivityServer {
@@ -477,8 +495,17 @@ impl BrowserActivityServer {
         Self::spawn_on(database_path, BROWSER_DIAGNOSTICS_PORT)
     }
 
-    fn spawn_on(database_path: PathBuf, port: u16) -> Result<Self, BrowserActivityError> {
-        let listener = TcpListener::bind(("127.0.0.1", port))?;
+    /// Starts the receiver on an explicit port. Port 0 requests an ephemeral
+    /// loopback port from the operating system for isolated validation.
+    pub fn spawn_on(database_path: PathBuf, port: u16) -> Result<Self, BrowserActivityError> {
+        let listener = match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                return Err(BrowserActivityError::PortInUse { port });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let actual_port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -528,7 +555,15 @@ impl BrowserActivityServer {
                                 }
                             }
 
-                            match handle_connection(&mut stream, storage.as_mut()) {
+                            let status = build_server_status(
+                                actual_port,
+                                &worker_path,
+                                &worker_listening,
+                                &worker_events,
+                                &worker_last_event,
+                                &worker_error,
+                            );
+                            match handle_connection(&mut stream, storage.as_mut(), &status) {
                                 Ok(accepted) => {
                                     if accepted {
                                         worker_events.fetch_add(1, Ordering::Relaxed);
@@ -536,15 +571,7 @@ impl BrowserActivityServer {
                                             .store(now_millis().max(0) as u64, Ordering::Relaxed);
                                     }
                                 }
-                                Err(error) => {
-                                    set_last_error(&worker_error, error.to_string());
-                                    let _ = write_json_response(
-                                        &mut stream,
-                                        400,
-                                        r#"{"ok":false,"error":"invalid event"}"#,
-                                        None,
-                                    );
-                                }
+                                Err(error) => set_last_error(&worker_error, error.to_string()),
                             }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -566,7 +593,7 @@ impl BrowserActivityServer {
             last_event_ms,
             last_error,
             database_path,
-            port,
+            port: actual_port,
             handle: Some(handle),
         })
     }
@@ -577,14 +604,19 @@ impl BrowserActivityServer {
         }
     }
 
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     pub fn status(&self) -> BrowserServerStatus {
-        let last = self.last_event_ms.load(Ordering::Relaxed);
-        BrowserServerStatus {
-            listening: self.listening.load(Ordering::SeqCst),
-            accepted_events: self.accepted_events.load(Ordering::Relaxed),
-            last_event_ms: (last > 0).then_some(last),
-            last_error: self.last_error.lock().ok().and_then(|value| value.clone()),
-        }
+        build_server_status(
+            self.port,
+            &self.database_path,
+            &self.listening,
+            &self.accepted_events,
+            &self.last_event_ms,
+            &self.last_error,
+        )
     }
 
     pub fn shutdown(mut self) -> Result<(), BrowserActivityError> {
@@ -609,21 +641,109 @@ impl Drop for BrowserActivityServer {
     }
 }
 
+fn build_server_status(
+    port: u16,
+    database_path: &RwLock<PathBuf>,
+    listening: &AtomicBool,
+    accepted_events: &AtomicU64,
+    last_event_ms: &AtomicU64,
+    last_error: &Mutex<Option<String>>,
+) -> BrowserServerStatus {
+    let last = last_event_ms.load(Ordering::Relaxed);
+    BrowserServerStatus {
+        product: "win-domain-flow".to_string(),
+        pid: std::process::id(),
+        port,
+        database_path: database_path
+            .read()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        listening: listening.load(Ordering::SeqCst),
+        accepted_events: accepted_events.load(Ordering::Relaxed),
+        last_event_ms: (last > 0).then_some(last),
+        last_error: last_error.lock().ok().and_then(|value| value.clone()),
+        expected_extension_id: BROWSER_EXTENSION_ID.to_string(),
+    }
+}
+
+/// Probes an existing receiver without modifying its database or WAL.
+pub fn probe_server_status(port: u16) -> Result<Option<BrowserServerStatus>, BrowserActivityError> {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = match TcpStream::connect_timeout(&address, Duration::from_millis(300)) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    stream.write_all(
+        format!("GET /status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )?;
+    stream.flush()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let Some(header_end) = find_bytes(&response, b"\r\n\r\n") else {
+        return Ok(None);
+    };
+    let headers = std::str::from_utf8(&response[..header_end])
+        .map_err(|_| BrowserActivityError::Protocol("status response is not UTF-8"))?;
+    if !headers.starts_with("HTTP/1.1 200") {
+        return Ok(None);
+    }
+    let status: BrowserServerStatus = serde_json::from_slice(&response[header_end + 4..])?;
+    if status.product != "win-domain-flow" {
+        return Ok(None);
+    }
+    Ok(Some(status))
+}
+
 fn handle_connection(
     stream: &mut TcpStream,
     storage: Option<&mut BrowserActivityStorage>,
+    status: &BrowserServerStatus,
 ) -> Result<bool, BrowserActivityError> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let request = read_http_request(stream)?;
-    let allowed_origin = allowed_extension_origin(request.origin.as_deref())?;
+    let cors_origin = request
+        .origin
+        .as_deref()
+        .and_then(|origin| require_extension_origin(Some(origin)).ok());
 
-    if request.method == "OPTIONS" {
-        write_empty_response(stream, 204, allowed_origin.as_deref())?;
+    if request.method == "GET" && request.path == "/health" {
+        let body = serde_json::json!({
+            "ok": true,
+            "product": "win-domain-flow",
+            "pid": status.pid,
+            "port": status.port
+        })
+        .to_string();
+        write_json_response(stream, 200, &body, cors_origin.as_deref())?;
         return Ok(false);
     }
-    if request.method == "GET" && request.path == "/health" {
-        write_json_response(stream, 200, r#"{"ok":true}"#, allowed_origin.as_deref())?;
+    if request.method == "GET" && request.path == "/status" {
+        let body = serde_json::to_string(status)?;
+        write_json_response(stream, 200, &body, cors_origin.as_deref())?;
+        return Ok(false);
+    }
+    if request.method == "OPTIONS" && request.path == "/events" {
+        match require_extension_origin(request.origin.as_deref()) {
+            Ok(origin) => write_empty_response(stream, 204, Some(&origin))?,
+            Err(_) => write_json_response(
+                stream,
+                403,
+                r#"{"ok":false,"error":"extension origin required"}"#,
+                None,
+            )?,
+        }
         return Ok(false);
     }
     if request.method != "POST" || request.path != "/events" {
@@ -631,17 +751,54 @@ fn handle_connection(
             stream,
             404,
             r#"{"ok":false,"error":"not found"}"#,
-            allowed_origin.as_deref(),
+            cors_origin.as_deref(),
         )?;
         return Ok(false);
     }
 
-    let payload: BrowserEventPayload = serde_json::from_slice(&request.body)?;
-    let Some(storage) = storage else {
-        return Err(BrowserActivityError::Protocol("database not initialized"));
+    let origin = match require_extension_origin(request.origin.as_deref()) {
+        Ok(origin) => origin,
+        Err(_) => {
+            write_json_response(
+                stream,
+                403,
+                r#"{"ok":false,"error":"extension origin required"}"#,
+                None,
+            )?;
+            return Ok(false);
+        }
     };
-    storage.record(payload)?;
-    write_json_response(stream, 200, r#"{"ok":true}"#, allowed_origin.as_deref())?;
+    let payload: BrowserEventPayload = match serde_json::from_slice(&request.body) {
+        Ok(payload) => payload,
+        Err(_) => {
+            write_json_response(
+                stream,
+                400,
+                r#"{"ok":false,"error":"invalid JSON"}"#,
+                Some(&origin),
+            )?;
+            return Ok(false);
+        }
+    };
+    let Some(storage) = storage else {
+        write_json_response(
+            stream,
+            500,
+            r#"{"ok":false,"error":"database unavailable"}"#,
+            Some(&origin),
+        )?;
+        return Ok(false);
+    };
+    if storage.record(payload).is_err() {
+        write_json_response(
+            stream,
+            400,
+            r#"{"ok":false,"error":"invalid event"}"#,
+            Some(&origin),
+        )?;
+        return Ok(false);
+    }
+    write_json_response(stream, 200, r#"{"ok":true,"accepted":true}"#, Some(&origin))?;
     Ok(true)
 }
 
@@ -723,22 +880,20 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, BrowserActiv
     })
 }
 
-fn allowed_extension_origin(origin: Option<&str>) -> Result<Option<String>, BrowserActivityError> {
-    let Some(origin) = origin.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    let valid = ["chrome-extension://", "edge-extension://"]
-        .iter()
-        .find_map(|prefix| origin.strip_prefix(prefix))
-        .map(|extension_id| {
-            let extension_id = extension_id.trim_end_matches('/');
-            !extension_id.is_empty() && !extension_id.contains('/')
-        })
-        .unwrap_or(false);
-    if valid {
-        Ok(Some(origin.to_string()))
+fn require_extension_origin(origin: Option<&str>) -> Result<String, BrowserActivityError> {
+    let origin = origin
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(BrowserActivityError::Protocol("missing extension origin"))?;
+    let normalized = origin.trim_end_matches('/');
+    let chrome = format!("chrome-extension://{BROWSER_EXTENSION_ID}");
+    let edge = format!("edge-extension://{BROWSER_EXTENSION_ID}");
+    if normalized == chrome || normalized == edge {
+        Ok(normalized.to_string())
     } else {
-        Err(BrowserActivityError::Protocol("origin is not an extension"))
+        Err(BrowserActivityError::Protocol(
+            "unexpected extension origin",
+        ))
     }
 }
 
@@ -789,6 +944,7 @@ fn status_reason(status: u16) -> &'static str {
         200 => "OK",
         204 => "No Content",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         500 => "Internal Server Error",
         _ => "Response",
@@ -955,6 +1111,21 @@ mod tests {
     }
 
     #[test]
+    fn transferred_bytes_never_regress_to_zero() {
+        let path = temp_db_path("monotonic_bytes");
+        let mut storage = BrowserActivityStorage::open(&path).unwrap();
+        let mut payload = request_payload();
+        storage.record(payload.clone()).unwrap();
+        payload.transferred_bytes = Some(0);
+        payload.mime = None;
+        storage.record(payload).unwrap();
+        let rows = storage.recent_requests(Some("example.com"), 0, 10).unwrap();
+        assert_eq!(rows[0].transferred_bytes, Some(8192));
+        assert_eq!(rows[0].mime.as_deref(), Some("application/octet-stream"));
+        cleanup(&path);
+    }
+
+    #[test]
     fn download_updates_preserve_known_fields() {
         let path = temp_db_path("download");
         let mut storage = BrowserActivityStorage::open(&path).unwrap();
@@ -1023,15 +1194,154 @@ mod tests {
     }
 
     #[test]
-    fn only_extension_origins_are_allowed() {
-        assert_eq!(
-            allowed_extension_origin(Some("chrome-extension://abcdefghijklmnop"))
-                .unwrap()
-                .as_deref(),
-            Some("chrome-extension://abcdefghijklmnop")
+    fn receiver_accepts_only_the_packaged_extension_origin() {
+        let chrome = format!("chrome-extension://{BROWSER_EXTENSION_ID}");
+        let edge = format!("edge-extension://{BROWSER_EXTENSION_ID}");
+        assert_eq!(require_extension_origin(Some(&chrome)).unwrap(), chrome);
+        assert_eq!(require_extension_origin(Some(&edge)).unwrap(), edge);
+        assert!(require_extension_origin(None).is_err());
+        assert!(require_extension_origin(Some("chrome-extension://wrongid")).is_err());
+        assert!(require_extension_origin(Some("https://example.com")).is_err());
+    }
+
+    fn receiver_request(
+        port: u16,
+        method: &str,
+        path: &str,
+        origin: Option<&str>,
+        body: &str,
+    ) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let origin_header = origin.map_or_else(String::new, |value| format!("Origin: {value}\r\n"));
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{origin_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
         );
-        assert!(allowed_extension_origin(Some("https://example.com")).is_err());
-        assert_eq!(allowed_extension_origin(None).unwrap(), None);
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    fn receiver_event(event_id: &str) -> String {
+        serde_json::json!({
+            "kind": "request",
+            "eventId": event_id,
+            "timestampMs": 1000,
+            "host": "example.com",
+            "url": "https://example.com/asset.bin",
+            "resourceType": "fetch",
+            "transferredBytes": 4096
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn receiver_status_and_health_are_available_without_origin() {
+        let path = temp_db_path("receiver_status");
+        let server = BrowserActivityServer::spawn_on(path.clone(), 0).unwrap();
+        let port = server.port();
+        let health = receiver_request(port, "GET", "/health", None, "");
+        assert!(health.starts_with("HTTP/1.1 200"));
+        assert!(health.contains("win-domain-flow"));
+        let status_response = receiver_request(port, "GET", "/status", None, "");
+        assert!(status_response.starts_with("HTTP/1.1 200"));
+        assert!(status_response.contains(&std::process::id().to_string()));
+        assert!(status_response.contains(BROWSER_EXTENSION_ID));
+        server.shutdown().unwrap();
+        cleanup(&path);
+    }
+
+    #[test]
+    fn receiver_rejects_missing_and_wrong_origins_but_accepts_packaged_extension() {
+        let path = temp_db_path("receiver_auth");
+        let server = BrowserActivityServer::spawn_on(path.clone(), 0).unwrap();
+        let port = server.port();
+        let body = receiver_event("auth-1");
+        assert!(receiver_request(port, "POST", "/events", None, &body).starts_with("HTTP/1.1 403"));
+        assert!(receiver_request(
+            port,
+            "POST",
+            "/events",
+            Some("chrome-extension://wrongid"),
+            &body,
+        )
+        .starts_with("HTTP/1.1 403"));
+        let origin = format!("chrome-extension://{BROWSER_EXTENSION_ID}");
+        let accepted = receiver_request(port, "POST", "/events", Some(&origin), &body);
+        assert!(accepted.starts_with("HTTP/1.1 200"));
+        assert!(accepted.contains("\"accepted\":true"));
+        server.shutdown().unwrap();
+        let storage = BrowserActivityStorage::open(&path).unwrap();
+        assert_eq!(
+            storage
+                .recent_requests(Some("example.com"), 0, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn receiver_handles_bad_json_concurrency_path_switch_and_restart() {
+        let first = temp_db_path("receiver_first");
+        let second = temp_db_path("receiver_second");
+        let server = BrowserActivityServer::spawn_on(first.clone(), 0).unwrap();
+        let port = server.port();
+        let origin = format!("chrome-extension://{BROWSER_EXTENSION_ID}");
+        assert!(
+            receiver_request(port, "POST", "/events", Some(&origin), "{")
+                .starts_with("HTTP/1.1 400")
+        );
+
+        let mut workers = Vec::new();
+        for index in 0..8 {
+            let origin = origin.clone();
+            workers.push(thread::spawn(move || {
+                let body = receiver_event(&format!("concurrent-{index}"));
+                receiver_request(port, "POST", "/events", Some(&origin), &body)
+            }));
+        }
+        for worker in workers {
+            assert!(worker.join().unwrap().starts_with("HTTP/1.1 200"));
+        }
+
+        server.set_database_path(second.clone());
+        let switched = receiver_event("switched-db");
+        assert!(
+            receiver_request(port, "POST", "/events", Some(&origin), &switched)
+                .starts_with("HTTP/1.1 200")
+        );
+        server.shutdown().unwrap();
+        assert_eq!(
+            BrowserActivityStorage::open(&first)
+                .unwrap()
+                .recent_requests(None, 0, 20)
+                .unwrap()
+                .len(),
+            8
+        );
+        assert_eq!(
+            BrowserActivityStorage::open(&second)
+                .unwrap()
+                .recent_requests(None, 0, 20)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let restarted = BrowserActivityServer::spawn_on(second.clone(), port).unwrap();
+        let probed = probe_server_status(port).unwrap().unwrap();
+        assert_eq!(probed.pid, std::process::id());
+        assert_eq!(probed.port, port);
+        restarted.shutdown().unwrap();
+        cleanup(&first);
+        cleanup(&second);
     }
 
     #[test]

@@ -12,14 +12,18 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   linux-quality:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install native build dependencies
         run: |
@@ -42,31 +46,58 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Validate browser extension syntax and policy
+      - name: Validate browser extension identity, syntax, and privacy policy
         shell: bash
         run: |
           node --check browser-extension/service_worker.js
           node --check browser-extension/popup.js
+          python3 -m py_compile tools/browser_fixture.py tools/query_e2e_db.py
           python3 - <<'PY'
+          import base64
+          import hashlib
           import json
+          import re
           from pathlib import Path
 
           manifest = json.loads(Path("browser-extension/manifest.json").read_text())
           permissions = set(manifest.get("permissions", []))
           hosts = manifest.get("host_permissions", [])
           worker = Path("browser-extension/service_worker.js").read_text()
+          rust = Path("src/browser_activity.rs").read_text()
 
           assert manifest.get("manifest_version") == 3
-          assert "debugger" in permissions
-          assert "downloads" in permissions
+          assert manifest.get("version") == "0.6.0"
+          for permission in {"alarms", "debugger", "downloads", "storage", "tabs"}:
+              assert permission in permissions
           assert "webRequest" not in permissions
           assert "<all_urls>" not in hosts
-          assert hosts == ["http://127.0.0.1:38765/*"]
+          assert hosts == ["http://127.0.0.1/*"]
+          assert manifest.get("action", {}).get("default_popup") == "popup.html"
+
+          public_key = base64.b64decode(manifest["key"], validate=True)
+          digest = hashlib.sha256(public_key).digest()[:16]
+          derived_id = "".join(
+              chr(ord("a") + (byte >> 4)) + chr(ord("a") + (byte & 0x0F))
+              for byte in digest
+          )
+          match = re.search(r'BROWSER_EXTENSION_ID:\s*&str\s*=\s*"([a-p]{32})"', rust)
+          assert match, "Rust Receiver extension ID constant missing"
+          assert derived_id == match.group(1), (derived_id, match.group(1))
+
+          assert "pendingEventQueue" in worker
+          assert "RETRY_BASE_MS" in worker and "RETRY_MAX_MS" in worker
+          assert "MAX_QUEUE_BYTES" in worker
+          assert "response.json()" in worker
+          assert "accepted !== true" in worker
+          assert "reportChain" in worker
+          assert "revision" in worker
+          assert "redirectResponse" in worker
+          assert "transferredBytes: null" in worker
           assert "Network.dataReceived" in worker
           assert "Network.loadingFinished" in worker
           assert "Network.getResponseBody" not in worker
-          assert "127.0.0.1:38765" in worker
           assert Path("browser-extension/README_CN.md").is_file()
+          print(f"stable_extension_id={derived_id}")
           PY
 
       - name: Format
@@ -88,14 +119,15 @@ jobs:
         run: |
           test -f target/release/win-domain-flow
           test -f target/release/win-domain-flow-gui
+          test -f target/release/win-domain-flow-browser-receiver
 
   windows-product:
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 80
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust 1.88.0 MSVC
         uses: dtolnay/rust-toolchain@1.88.0
@@ -168,6 +200,114 @@ jobs:
           $root = "target\x86_64-pc-windows-msvc\release"
           if (!(Test-Path "$root\win-domain-flow.exe")) { throw "CLI executable missing" }
           if (!(Test-Path "$root\win-domain-flow-gui.exe")) { throw "GUI executable missing" }
+          if (!(Test-Path "$root\win-domain-flow-browser-receiver.exe")) { throw "Receiver helper executable missing" }
+
+      - name: Validate PowerShell harness syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path tools\validate-windows.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host $_.Message }
+            throw "PowerShell validation harness contains syntax errors"
+          }
+
+      - name: Install Chrome for Testing
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $metadataUrl = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
+          $metadata = Invoke-RestMethod -Uri $metadataUrl -TimeoutSec 30
+          $stable = $metadata.channels.Stable
+          $download = @($stable.downloads.chrome | Where-Object { $_.platform -eq "win64" })[0]
+          if (-not $download -or -not $download.url) {
+            throw "Chrome for Testing win64 Stable download was not present in official metadata"
+          }
+
+          $archive = Join-Path $env:RUNNER_TEMP "chrome-for-testing.zip"
+          $extractRoot = Join-Path $env:RUNNER_TEMP "chrome-for-testing"
+          # Stage under the real Program Files ACL tree. Chrome's Windows
+          # sandbox AppContainer cannot execute a copied browser from the
+          # hosted runner's private _temp ACL tree.
+          $programRoot = Join-Path $env:ProgramFiles "DomainFlow-CfT-ProgramFiles"
+          $targetDir = Join-Path $programRoot "Google\Chrome\Application"
+          Remove-Item $archive, $extractRoot, $programRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+          $downloaded = $false
+          for ($attempt = 1; $attempt -le 4; $attempt++) {
+            Write-Host "Downloading Chrome for Testing $($stable.version), attempt $attempt of 4"
+            Remove-Item $archive -Force -ErrorAction SilentlyContinue
+            & curl.exe `
+              --fail `
+              --location `
+              --retry 5 `
+              --retry-all-errors `
+              --retry-delay 3 `
+              --connect-timeout 20 `
+              --max-time 300 `
+              --output $archive `
+              $download.url
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $archive)) {
+              $size = (Get-Item $archive).Length
+              if ($size -gt 10000000) {
+                $downloaded = $true
+                break
+              }
+              Write-Warning "Chrome for Testing archive was unexpectedly small: $size bytes"
+            }
+            Start-Sleep -Seconds (5 * $attempt)
+          }
+          if (-not $downloaded) { throw "Failed to download Chrome for Testing" }
+
+          Expand-Archive -Path $archive -DestinationPath $extractRoot -Force
+          $chrome = Get-ChildItem $extractRoot -Recurse -Filter chrome.exe | Select-Object -First 1
+          if (-not $chrome) { throw "Chrome for Testing chrome.exe was not found" }
+          New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+          Copy-Item (Join-Path $chrome.DirectoryName "*") $targetDir -Recurse -Force
+          $stagedChrome = Join-Path $targetDir "chrome.exe"
+          if (!(Test-Path $stagedChrome)) {
+            throw "Chrome for Testing staging failed"
+          }
+
+          # Keep grants read/execute only and scoped to the isolated test
+          # browser. Program Files normally inherits these ACLs; the explicit
+          # grants make the hosted-runner sandbox requirement deterministic.
+          & icacls.exe $programRoot /grant "*S-1-15-2-1:(OI)(CI)RX" /T /C | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "Failed to grant ALL APPLICATION PACKAGES read/execute access" }
+          & icacls.exe $programRoot /grant "*S-1-15-2-2:(OI)(CI)RX" /T /C | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "Failed to grant ALL RESTRICTED APPLICATION PACKAGES read/execute access" }
+
+          "DOMAINFLOW_BROWSER_EXECUTABLE=$stagedChrome" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "DOMAINFLOW_CFT_VERSION=$($stable.version)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Isolated Chrome for Testing browser diagnostics E2E
+        timeout-minutes: 6
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:DOMAINFLOW_BROWSER_EXECUTABLE)) {
+            throw "Chrome for Testing executable path is missing"
+          }
+          Write-Host "Using Chrome for Testing $env:DOMAINFLOW_CFT_VERSION"
+          Write-Host "Browser executable: $env:DOMAINFLOW_BROWSER_EXECUTABLE"
+          $report = Join-Path $env:RUNNER_TEMP "domainflow-browser-e2e"
+          .\tools\validate-windows.ps1 `
+            -BinaryRoot ".\target\x86_64-pc-windows-msvc\release" `
+            -OutputDirectory $report `
+            -CiMode
+
+      - name: Upload browser E2E evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-domain-flow-browser-e2e-evidence
+          if-no-files-found: warn
+          retention-days: 14
+          path: ${{ runner.temp }}/domainflow-browser-e2e/**
 
       - name: Assemble Windows package
         shell: pwsh
@@ -180,8 +320,13 @@ jobs:
 
           Copy-Item "$source\win-domain-flow.exe" $package
           Copy-Item "$source\win-domain-flow-gui.exe" $package
+          Copy-Item "$source\win-domain-flow-browser-receiver.exe" $package
           Copy-Item README.md, INSTALL.md, INSTALL_CN.md $package
           Copy-Item browser-extension "$package\browser-extension" -Recurse
+          New-Item -ItemType Directory -Path "$package\tools" -Force | Out-Null
+          Copy-Item tools\validate-windows.ps1 "$package\tools"
+          Copy-Item tools\browser_fixture.py "$package\tools"
+          Copy-Item tools\query_e2e_db.py "$package\tools"
 
           @'
           @echo off
@@ -191,6 +336,7 @@ jobs:
           $required = @(
             "$package\win-domain-flow.exe",
             "$package\win-domain-flow-gui.exe",
+            "$package\win-domain-flow-browser-receiver.exe",
             "$package\README.md",
             "$package\INSTALL.md",
             "$package\INSTALL_CN.md",
@@ -199,16 +345,98 @@ jobs:
             "$package\browser-extension\service_worker.js",
             "$package\browser-extension\popup.html",
             "$package\browser-extension\popup.js",
-            "$package\browser-extension\README_CN.md"
+            "$package\browser-extension\README_CN.md",
+            "$package\tools\validate-windows.ps1",
+            "$package\tools\browser_fixture.py",
+            "$package\tools\query_e2e_db.py"
           )
           foreach ($item in $required) {
             if (!(Test-Path $item)) { throw "Package item missing: $item" }
           }
 
+          $forbidden = @(Get-ChildItem $package -Recurse -Force | Where-Object {
+            $_.Name -match '(?i)\.(pem|key|pfx|p12|db)$' -or
+            $_.Name -match '(?i)(\.db-wal|\.db-shm|validation-report|validation-manifest|edge-profile)'
+          })
+          if ($forbidden.Count -gt 0) {
+            $forbidden | ForEach-Object { Write-Host "Forbidden package item: $($_.FullName)" }
+            throw "Release package contains private, runtime, or validation-only files"
+          }
+
       - name: Upload Windows x64 package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: win-domain-flow-windows-x64
           if-no-files-found: error
           retention-days: 14
           path: dist/win-domain-flow-windows-x64/**
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs:
+      - linux-quality
+      - windows-product
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v6
+
+      - name: Download validated Windows package
+        uses: actions/download-artifact@v8
+        with:
+          name: win-domain-flow-windows-x64
+          path: dist/win-domain-flow-windows-x64
+
+      - name: Prepare release assets
+        id: release_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          tag="v$version"
+          archive="win-domain-flow-${tag}-windows-x64.zip"
+          test -f dist/win-domain-flow-windows-x64/win-domain-flow-gui.exe
+          test -f dist/win-domain-flow-windows-x64/browser-extension/manifest.json
+          (cd dist && zip -q -r "../$archive" win-domain-flow-windows-x64)
+          sha256sum "$archive" > "$archive.sha256"
+          cat > RELEASE_NOTES.md <<EOF
+          ## win-domain-flow $tag
+
+          Windows x64 stable release built from commit \`$GITHUB_SHA\`.
+
+          Release gates completed before publication:
+          - Rust 1.88 format, check, tests, Clippy with \`-D warnings\`, and release build
+          - Windows MSVC check, Clippy, and release build against Npcap SDK 1.16
+          - isolated Chrome for Testing extension E2E using a temporary profile and SQLite database
+          - Receiver outage queueing and automatic replay after Receiver recovery
+          - release-package content and forbidden-file scan
+
+          Extract the ZIP and run \`Start-GUI-As-Administrator.cmd\`. Npcap must be installed for live packet capture.
+          EOF
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Publish immutable GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release_meta.outputs.tag }}
+          ARCHIVE: ${{ steps.release_meta.outputs.archive }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; refusing to overwrite an existing stable release."
+            exit 0
+          fi
+          gh release create "$TAG" \
+            "$ARCHIVE" \
+            "$ARCHIVE.sha256" \
+            --target "$GITHUB_SHA" \
+            --title "win-domain-flow $TAG" \
+            --notes-file RELEASE_NOTES.md \
+            --latest

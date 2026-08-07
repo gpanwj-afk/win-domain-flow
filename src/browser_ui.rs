@@ -1,7 +1,7 @@
 use crate::app_storage::TrafficPeriod;
 use crate::browser_activity::{
-    BrowserActivityServer, BrowserActivityStorage, BrowserDownloadRow, BrowserRequestRow,
-    BrowserResourceSummaryRow, BrowserServerStatus, BROWSER_DIAGNOSTICS_PORT,
+    probe_server_status, BrowserActivityServer, BrowserActivityStorage, BrowserDownloadRow,
+    BrowserRequestRow, BrowserResourceSummaryRow, BrowserServerStatus, BROWSER_DIAGNOSTICS_PORT,
 };
 use crate::settings::ThemeMode;
 use eframe::egui;
@@ -68,7 +68,19 @@ impl BrowserDiagnosticsPane {
     pub fn new(database_path: PathBuf) -> Self {
         let (server, server_error) = match BrowserActivityServer::spawn(database_path.clone()) {
             Ok(server) => (Some(server), None),
-            Err(error) => (None, Some(error.to_string())),
+            Err(error) => {
+                let detail = probe_server_status(BROWSER_DIAGNOSTICS_PORT)
+                    .ok()
+                    .flatten()
+                    .map(|status| {
+                        format!(
+                            "已有域流量管家实例占用 Receiver：PID {} · 数据库 {}",
+                            status.pid, status.database_path
+                        )
+                    })
+                    .unwrap_or_else(|| format!("Receiver 启动失败：{error}"));
+                (None, Some(detail))
+            }
         };
         Self {
             server,
@@ -381,6 +393,12 @@ fn render_server_status(
                     palette.blue,
                     palette,
                 );
+                status_chip(
+                    ui,
+                    &format!("PID {} · 端口 {}", status.pid, status.port),
+                    palette.blue,
+                    palette,
+                );
                 if let Some(last) = status.last_event_ms {
                     status_chip(
                         ui,
@@ -390,6 +408,11 @@ fn render_server_status(
                     );
                 }
             });
+            ui.label(
+                egui::RichText::new(format!("Receiver 数据库：{}", status.database_path))
+                    .small()
+                    .color(palette.muted),
+            );
             if let Some(error) = status.last_error {
                 ui.label(egui::RichText::new(error).color(palette.amber));
             }

@@ -1,25 +1,25 @@
-# win-domain-flow 0.5 Windows 安装指南
+# win-domain-flow 0.6 Windows 安装与验证指南
 
 ## 一、运行环境
 
 - Windows 10/11 x64
 - 官方 Npcap
-- 建议安装 Npcap 时启用 `WinPcap API-compatible Mode`
-- 不要安装或使用 Win10Pcap
+- 建议 Npcap 启用 `WinPcap API-compatible Mode`
+- 不要使用 Win10Pcap
 
-直接使用成品包时不需要安装 Rust、Visual Studio 或 Npcap SDK。
+直接使用 Windows 成品包不需要安装 Rust、Visual Studio 或 Npcap SDK。
 
 ## 二、升级前保护数据
 
-正常点击旧版 GUI 中的“停止并安全保存”，等待状态变为已停止。
+正常点击旧版 GUI 的“停止并安全保存”，等待状态变为已停止。
 
-数据库默认位于：
+默认数据目录：
 
 ```text
-%LOCALAPPDATA%\win-domain-flow\domainflow.db
+%LOCALAPPDATA%\win-domain-flow\
 ```
 
-建议升级前复制以下文件到备份目录：
+主要文件：
 
 ```text
 domainflow.db
@@ -28,11 +28,28 @@ domainflow.db-shm
 settings.conf
 ```
 
-不要在 GUI 仍然运行时复制或删除数据库。
+不要在旧 GUI 仍写库时删除这些文件。
 
-## 三、安装桌面程序
+## 三、0.6 数据库路径变化
 
-1. 解压 Windows x64 成品包到固定目录，例如：
+0.6 默认数据库固定为：
+
+```text
+%LOCALAPPDATA%\win-domain-flow\domainflow.db
+```
+
+GUI 会直接显示当前实际数据库的绝对路径，不再在工作目录数据库和 LOCALAPPDATA 数据库之间静默选择。
+
+如果旧版本使用的是程序自动选择的工作目录 `domainflow.db`，无论该默认路径是否已经被旧版写入 `settings.conf`，0.6 都会识别这一精确旧默认路径，并通过 SQLite online backup API 创建一致性快照到固定目录。用户真正手工指定的自定义数据库路径不会被自动迁移：
+
+- 包含已提交但仍在 WAL 中的数据
+- 不执行 `wal_checkpoint(TRUNCATE)`
+- 不修改或删除原数据库
+- 迁移失败会明确显示继续使用的旧库绝对路径
+
+## 四、安装桌面程序
+
+1. 解压成品包，例如：
 
 ```text
 C:\Tools\win-domain-flow
@@ -44,104 +61,104 @@ C:\Tools\win-domain-flow
 Start-GUI-As-Administrator.cmd
 ```
 
-3. 接受 Windows 管理员权限提示。
-4. 在 GUI 中选择当前联网的物理网卡。
+3. 接受管理员权限提示。
+4. 选择当前联网物理网卡。
 5. 点击“开始记录流量”。
 
-GUI 默认使用明亮模式，可以在右上角切换深色模式。
+### 单实例保护
 
-## 四、响应式界面
+如果已经有域流量管家实例占用 Receiver，第二次启动不会再启动第二套抓包或数据库写入链路，而会显示已有实例的：
 
-- 宽窗口：应用排行与域名排行左右显示
-- 窄窗口：应用排行与域名排行上下显示
-- 顶部指标卡会根据宽度自动显示为 5 列、3 列或 2 列
-- 左侧控制栏可以拖动改变宽度
-- 主内容可以纵向滚动
+- PID
+- Receiver 端口
+- SQLite 路径
 
-## 五、安装 Edge/Chrome 浏览器活动诊断扩展
+这用于避免“旧 GUI 没停干净，却又启动第二个 GUI”的假验证状态。
 
-该扩展是可选功能，默认不启用。只有需要追查某个网页域名为什么产生大量流量时才安装并打开。
+## 五、浏览器扩展升级与安装
+
+浏览器活动诊断是可选功能。
+
+0.6 扩展使用固定发行公钥。若从 0.5 或更早版本升级，建议在 Edge/Chrome 扩展管理页重新加载当前发行包中的 `browser-extension` 文件夹一次。
 
 ### Edge
 
-1. 启动域流量管家 GUI。
-2. 在“浏览器活动诊断”区域点击“打开扩展安装目录”。
-3. 打开：
-
-```text
-edge://extensions
-```
-
-4. 开启“开发人员模式”。
-5. 点击“加载解压缩的扩展”。
-6. 选择成品包中的：
+1. 打开 `edge://extensions`。
+2. 开启开发人员模式。
+3. 点击“加载解压缩的扩展”。
+4. 选择：
 
 ```text
 browser-extension
 ```
 
-7. 固定扩展图标。
-8. 点击扩展图标。
-9. 打开“启用深度诊断”。
-10. 重新加载需要排查的网页。
+5. 固定扩展图标。
+6. 点击扩展图标并打开“启用深度诊断”。
 
-### Chrome
-
-步骤相同，扩展管理地址为：
+Chrome 对应地址：
 
 ```text
 chrome://extensions
 ```
 
-## 六、追查大流量域名
+## 六、Receiver 安全与状态
 
-以 `tlabel.tencent.com` 为例：
+默认 Receiver：
 
-1. 保持 GUI 运行。
-2. 启用浏览器扩展的深度诊断。
-3. 重新加载或重新执行会产生流量的网页操作。
-4. 在 GUI 的“域名筛选”中输入：
+```text
+127.0.0.1:38765
+```
+
+本机只读状态接口：
+
+```text
+http://127.0.0.1:38765/health
+http://127.0.0.1:38765/status
+```
+
+`/status` 可核对 Receiver PID、数据库绝对路径、事件计数和最近错误。
+
+浏览器事件写入 `/events` 时必须来自 0.6 发行扩展的精确 Origin。缺失 Origin、其他扩展 ID 和普通网页来源会被拒绝。
+
+## 七、Receiver 暂时不可用时
+
+扩展不会再立即丢弃事件。
+
+0.6 使用：
+
+- 持久化有界队列，最多 1000 条，同时将序列化队列控制在约 4 MiB 以内
+- JSON ACK
+- 指数退避
+- `chrome.alarms` 自动恢复补发
+
+弹窗会显示：
+
+- 待补发事件数
+- 最近 Receiver 错误
+- 标签页附加失败数
+- 队列是否发生过溢出丢弃
+
+Receiver 恢复后队列会自行继续发送。
+
+## 八、追查大流量域名
+
+例如：
 
 ```text
 tlabel.tencent.com
 ```
 
-5. 查看“最近网页请求”。请求默认按实际传输字节从大到小排列。
-6. 重点观察：
-   - URL 路径
-   - 实际传输大小
-   - 资源类型
-   - MIME
-   - HTTP 状态码
-   - HTTP/2、HTTP/3 等协议
-   - 是否来自缓存
-   - 来源页面
-7. 查看“网页资源用途”汇总，判断流量主要来自音视频、Fetch/XHR、脚本、图片或其他资源。
-8. 查看“真实下载文件”，确认是否存在浏览器下载管理器接管的文件。
-
-## 七、浏览器提示“正在调试此标签页”
-
-这是正常现象。扩展使用浏览器公开的调试协议读取 Network 元数据和实际编码传输字节。
-
-扩展不会读取响应正文，也不会安装 HTTPS 中间人证书。
-
-排查完成后，在扩展弹窗中关闭“启用深度诊断”，提示会随调试会话结束而消失。
-
-## 八、数据保存
-
-桌面流量、浏览器请求元数据和下载记录都保存在：
-
-```text
-%LOCALAPPDATA%\win-domain-flow\domainflow.db
-```
-
-关闭 GUI或重启电脑不会清空数据。默认查看“本月累计”。
-
-完整 URL 可能含有敏感查询参数。数据库只保存在本机，但仍不应随意发送给他人。
+1. 保持 GUI 运行。
+2. 打开扩展深度诊断。
+3. 重新执行产生流量的网页操作。
+4. 在 GUI 域名筛选中输入目标域名。
+5. 查看按实际传输字节排序的请求。
+6. 观察 URL、资源类型、MIME、状态码、协议、缓存状态和来源页面。
+7. 查看“真实下载文件”确认是否为浏览器下载管理器接管的文件。
 
 ## 九、停止程序
 
-结束抓包时必须点击：
+结束抓包时点击：
 
 ```text
 停止并安全保存
@@ -157,10 +174,10 @@ tlabel.tencent.com
 
 ## 十、源码构建
 
-只有需要从源码构建时才需要：
+需要：
 
 - Rust 1.88.0 MSVC
-- Visual Studio Build Tools 2022 C++ 工作负载
+- Visual Studio Build Tools C++ 工作负载
 - Npcap SDK 1.16
 
 管理员 PowerShell：
@@ -176,35 +193,89 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo build --release --locked
 ```
 
-## 十一、常见问题
+## 十一、隔离式 Windows 验证
 
-### GUI 无法枚举网卡
-
-确认官方 Npcap 服务正在运行：
-
-```powershell
-Get-Service npcap, npf -ErrorAction SilentlyContinue
-```
-
-### 扩展显示未连接
-
-确认 GUI 正在运行。本地接收器只监听：
+0.6 成品包附带验证工具：
 
 ```text
-127.0.0.1:38765
+tools\validate-windows.ps1
+tools\browser_fixture.py
+tools\query_e2e_db.py
 ```
 
-### 扩展已启用但没有请求
+运行：
 
-- 重新加载目标网页
-- 确认页面是 `http://` 或 `https://`
-- 关闭该标签页的 DevTools 后重试
-- 查看扩展弹窗是否显示已跟踪标签页
+```powershell
+.\tools\validate-windows.ps1 `
+  -BinaryRoot . `
+  -OutputDirectory .\validation-report
+```
+
+若从源码目录运行：
+
+```powershell
+.\tools\validate-windows.ps1 `
+  -BinaryRoot .\target\release `
+  -OutputDirectory .\validation-report
+```
+
+### 验证器不会做的事
+
+- 不使用用户默认 Edge/Chrome Profile
+- 不执行 `Stop-Process -Name msedge`
+- 不写真实 `domainflow.db`
+- 不依赖公网测试站点
+- 不硬编码某次解压扩展的 ID
+- 不用 SQLite 文件修改时间判断 WAL 写入
+- 不执行数据库 checkpoint
+
+### 验证器会做的事
+
+- 新建临时浏览器 Profile
+- 使用动态 CDP 端口
+- 使用动态 Receiver 端口
+- 使用独立临时 SQLite
+- 启动仅监听 `127.0.0.1` 的 fixture
+- 动态发现扩展 Service Worker 与实际 ID，并与 Receiver 期望的发行 ID 严格核对
+- CDP connect/send/receive 使用硬超时，浏览器异常不会无限挂住
+- 用 `/status` 核对 Receiver PID 与数据库路径
+- 验证 request、实际传输字节和 download 记录
+- 故意停止 Receiver，在停机期间产生真实浏览器事件
+- 确认队列积压、错误可见、Receiver 恢复后自动补发
+- 使用 SQLite `mode=ro` 读取 WAL 中已提交数据
+- 最后只关闭本次临时 Profile 对应的浏览器 PID
+- 恢复本次临时 Profile 的诊断开关
+
+输出：
+
+```text
+validation-report.json
+validation-report.xml
+validation-manifest.json
+```
+
+manifest 记录 commit、二进制 SHA-256、Receiver PID/端口、浏览器 PID、Profile、扩展 ID 和测试数据库路径。
+
+## 十二、常见问题
+
+### 扩展显示 Receiver 未连接
+
+打开：
+
+```text
+http://127.0.0.1:38765/status
+```
+
+确认 PID 和数据库路径是否对应当前 GUI。若存在第二个旧实例，先回到旧窗口执行正常停止，而不是强杀全部进程。
+
+### 弹窗显示待补发事件
+
+说明 Receiver 曾暂时不可达。保持 GUI 正常运行，队列会自动重试。若持续不清零，查看弹窗中的 Receiver 错误及 GUI 的实际数据库路径。
 
 ### 没有真实下载文件
 
-网页视频、接口响应、缓存资源并不一定进入浏览器下载管理器。此时应查看“最近网页请求”和“网页资源用途”，而不是“真实下载文件”。
+网页视频、接口响应、缓存资源不一定进入浏览器下载管理器。此时查看“最近网页请求”和“网页资源用途”。
 
 ### Npcap 总流量与浏览器实际传输不一致
 
-属于正常现象。Npcap 包含网络头部和重传；浏览器诊断统计响应编码数据长度，两者用途不同。
+正常。Npcap 包含网络头部与重传；浏览器诊断统计浏览器报告的编码传输长度，两者用途不同。

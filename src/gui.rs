@@ -1,5 +1,6 @@
 use crate::app_runtime::{run_live_with_shutdown, ApplicationRunSummary};
 use crate::app_storage::{ApplicationStorage, TrafficPeriod};
+use crate::browser_activity::{probe_server_status, BrowserServerStatus, BROWSER_DIAGNOSTICS_PORT};
 use crate::browser_ui::BrowserDiagnosticsPane;
 use crate::capture::{list_devices, CaptureDeviceInfo};
 use crate::model::{
@@ -80,6 +81,9 @@ impl Palette {
 }
 
 pub fn run() -> eframe::Result<()> {
+    if let Ok(Some(status)) = probe_server_status(BROWSER_DIAGNOSTICS_PORT) {
+        return run_existing_instance_notice(status);
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
@@ -92,6 +96,41 @@ pub fn run() -> eframe::Result<()> {
         APP_TITLE,
         options,
         Box::new(|creation_context| Ok(Box::new(DashboardApp::new(creation_context)))),
+    )
+}
+
+struct ExistingInstanceApp {
+    status: BrowserServerStatus,
+}
+
+impl eframe::App for ExistingInstanceApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("域流量管家已在运行");
+            ui.add_space(10.0);
+            ui.label(format!("已有实例 PID：{}", self.status.pid));
+            ui.label(format!("Receiver 端口：{}", self.status.port));
+            ui.label(format!("数据库：{}", self.status.database_path));
+            ui.add_space(10.0);
+            ui.label(
+                "请切换到已有窗口。为避免两个实例同时写库，本窗口不会启动第二套抓包或 Receiver。",
+            );
+        });
+    }
+}
+
+fn run_existing_instance_notice(status: BrowserServerStatus) -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([620.0, 260.0])
+            .with_min_inner_size([520.0, 220.0]),
+        renderer: eframe::Renderer::Glow,
+        ..Default::default()
+    };
+    eframe::run_native(
+        "域流量管家 · 已在运行",
+        options,
+        Box::new(move |_creation_context| Ok(Box::new(ExistingInstanceApp { status }))),
     )
 }
 
@@ -172,7 +211,7 @@ struct DashboardApp {
 impl DashboardApp {
     fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         install_chinese_font(&creation_context.egui_ctx);
-        let settings = AppSettings::load();
+        let (settings, startup_notice) = AppSettings::load_with_notice();
         configure_style(&creation_context.egui_ctx, settings.theme);
 
         let browser_database_path = settings.database_path.clone();
@@ -198,11 +237,14 @@ impl DashboardApp {
             last_rate_sample: now,
             last_total_bytes: 0,
             bytes_per_second: 0.0,
-            notice: None,
+            notice: startup_notice.clone(),
             browser_diagnostics: BrowserDiagnosticsPane::new(browser_database_path),
         };
         app.refresh_devices();
         app.refresh_data(false);
+        if startup_notice.is_some() {
+            app.notice = startup_notice;
+        }
         app
     }
 
@@ -222,8 +264,10 @@ impl DashboardApp {
         }
     }
 
-    fn save_settings(&self) {
-        let _ = self.settings().save();
+    fn save_settings(&mut self) {
+        if let Err(error) = self.settings().save() {
+            self.notice = Some(format!("保存设置失败：{error}"));
+        }
     }
 
     fn toggle_theme(&mut self, ctx: &egui::Context) {
@@ -240,7 +284,6 @@ impl DashboardApp {
                 self.selected_device = previous
                     .filter(|name| self.devices.iter().any(|device| &device.name == name))
                     .or_else(|| choose_preferred_device(&self.devices));
-                self.notice = None;
                 self.save_settings();
             }
             Err(error) => {
@@ -378,9 +421,6 @@ impl DashboardApp {
                 self.selected_application = selected;
                 self.domains = domains;
                 self.totals = totals;
-                if !matches!(self.state, CaptureState::Failed(_)) {
-                    self.notice = None;
-                }
                 if update_rate {
                     self.update_rate();
                 }
@@ -514,6 +554,14 @@ impl DashboardApp {
                 self.capture.is_none(),
                 egui::TextEdit::singleline(&mut self.database_path)
                     .desired_width(ui.available_width()),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "实际使用：{}",
+                    PathBuf::from(self.database_path.trim()).display()
+                ))
+                .small()
+                .color(palette.muted),
             );
             ui.horizontal_wrapped(|ui| {
                 if ui.button("打开数据目录").clicked() {
@@ -830,7 +878,7 @@ impl Drop for DashboardApp {
         if let Some(worker) = self.capture.as_ref() {
             worker.request_stop();
         }
-        self.save_settings();
+        let _ = self.settings().save();
     }
 }
 

@@ -1,3 +1,4 @@
+use crate::browser_activity::{BrowserActivityServer, BROWSER_DIAGNOSTICS_PORT};
 use crate::capture::list_devices;
 use crate::model::DEFAULT_BPF_FILTER;
 use crate::runtime::{run_live, RuntimeConfig};
@@ -5,6 +6,8 @@ use crate::storage::Storage;
 use clap::{Parser, Subcommand};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Parser)]
@@ -49,6 +52,18 @@ pub enum Command {
 
         #[arg(long, default_value_t = 20)]
         limit: u32,
+    },
+
+    /// Run only the authenticated browser diagnostics receiver.
+    ///
+    /// This mode is intended for isolated validation and CI. It never starts
+    /// Npcap capture and therefore can safely use a temporary test database.
+    BrowserReceiver {
+        #[arg(long)]
+        db: PathBuf,
+
+        #[arg(long, default_value_t = BROWSER_DIAGNOSTICS_PORT)]
+        port: u16,
     },
 }
 
@@ -124,6 +139,32 @@ pub fn run_with_writer<W: Write>(cli: Cli, out: &mut W) -> anyhow::Result<()> {
             render_top_rows(&rows, out)?;
             Ok(())
         }
+        Command::BrowserReceiver { db, port } => {
+            if port != 0 && !(1024..=65535).contains(&port) {
+                anyhow::bail!("--port must be 0 or in 1024..=65535");
+            }
+            let server = BrowserActivityServer::spawn_on(db, port)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let status = server.status();
+            writeln!(
+                out,
+                "pid={}\tport={}\tdb={}",
+                status.pid,
+                status.port,
+                sanitize_tsv(&status.database_path)
+            )?;
+            out.flush()?;
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let signal = Arc::clone(&stop);
+            ctrlc::set_handler(move || {
+                signal.store(true, Ordering::SeqCst);
+            })?;
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            server.shutdown().map_err(|error| anyhow::anyhow!(error))
+        }
     }
 }
 
@@ -171,6 +212,19 @@ mod tests {
                 assert_eq!(bpf, DEFAULT_BPF_FILTER);
             }
             _ => panic!("expected Capture command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_browser_receiver_defaults() {
+        let cli = Cli::try_parse_from(["win-domain-flow", "browser-receiver", "--db", "test.db"])
+            .unwrap();
+        match cli.command {
+            Command::BrowserReceiver { db, port } => {
+                assert_eq!(db, PathBuf::from("test.db"));
+                assert_eq!(port, BROWSER_DIAGNOSTICS_PORT);
+            }
+            _ => panic!("expected BrowserReceiver command"),
         }
     }
 
