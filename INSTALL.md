@@ -29,3 +29,5 @@ tools\query_e2e_db.py
 ```
 
 The validator creates a temporary browser profile, temporary SQLite database, dynamic CDP/Receiver ports, and a local-only fixture. It does not operate on the user's default browser profile or production database. It dynamically discovers the unpacked extension ID, verifies Receiver PID/database ownership via `/status`, observes SQLite through read-only queries, verifies queued-event replay across a Receiver outage, and emits JSON/JUnit evidence plus a process/profile manifest.
+
+GitHub Actions runs the browser E2E against an isolated official Chrome for Testing build instead of depending on the hosted runner's interactive browser state, so extension loading and CDP control are reproducible without touching a user's browser profile.
