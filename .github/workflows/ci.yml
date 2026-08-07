@@ -231,7 +231,10 @@ jobs:
 
           $archive = Join-Path $env:RUNNER_TEMP "chrome-for-testing.zip"
           $extractRoot = Join-Path $env:RUNNER_TEMP "chrome-for-testing"
-          $fakeProgramFiles = Join-Path $env:RUNNER_TEMP "domainflow-cft-program-files"
+          # Stage the executable under the real Program Files ACL tree. Chrome's
+          # Windows sandbox AppContainer cannot execute a copied browser from
+          # GitHub Runner's private _temp ACL tree.
+          $fakeProgramFiles = Join-Path $env:ProgramFiles "DomainFlow-CfT-ProgramFiles"
           $targetDir = Join-Path $fakeProgramFiles "Google\Chrome\Application"
           Remove-Item $archive, $extractRoot, $fakeProgramFiles -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -269,6 +272,14 @@ jobs:
           if (!(Test-Path (Join-Path $targetDir "chrome.exe"))) {
             throw "Chrome for Testing staging failed"
           }
+
+          # Keep the grants read/execute only and scoped to the isolated test
+          # browser. Program Files normally already carries these ACLs, but the
+          # explicit grant makes the hosted-runner sandbox requirement stable.
+          & icacls.exe $fakeProgramFiles /grant "*S-1-15-2-1:(OI)(CI)RX" /T /C | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "Failed to grant ALL APPLICATION PACKAGES read/execute access" }
+          & icacls.exe $fakeProgramFiles /grant "*S-1-15-2-2:(OI)(CI)RX" /T /C | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "Failed to grant ALL RESTRICTED APPLICATION PACKAGES read/execute access" }
 
           "DOMAINFLOW_CFT_PROGRAM_FILES=$fakeProgramFiles" | Out-File -FilePath $env:GITHUB_ENV -Append
           "DOMAINFLOW_CFT_VERSION=$($stable.version)" | Out-File -FilePath $env:GITHUB_ENV -Append
