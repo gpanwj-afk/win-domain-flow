@@ -152,8 +152,8 @@ function Wait-FileLines {
 function Connect-Cdp {
     param([string]$Uri)
     $socket = [Net.WebSockets.ClientWebSocket]::new()
-    $socket.ConnectAsync([Uri]$Uri, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
-    return $socket
+    [void]$socket.ConnectAsync([Uri]$Uri, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+    return ,$socket
 }
 
 function Receive-CdpMessage {
@@ -188,7 +188,7 @@ function Send-Cdp {
     if (-not [string]::IsNullOrWhiteSpace($SessionId)) { $payload.sessionId = $SessionId }
     $json = $payload | ConvertTo-Json -Depth 50 -Compress
     $bytes = [Text.Encoding]::UTF8.GetBytes($json)
-    $Socket.SendAsync(
+    [void]$Socket.SendAsync(
         [ArraySegment[byte]]::new($bytes),
         [Net.WebSockets.WebSocketMessageType]::Text,
         $true,
