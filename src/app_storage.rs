@@ -276,6 +276,12 @@ pub enum ApplicationStorageError {
     #[error("invalid application query argument: {0}")]
     InvalidQuery(&'static str),
 
+    #[error("invalid application schema version value: {0}")]
+    InvalidSchemaVersion(String),
+
+    #[error("unsupported application schema version: {0}")]
+    UnsupportedSchemaVersion(i64),
+
     #[error("application database pragma mismatch: {0}")]
     PragmaMismatch(&'static str),
 
@@ -500,8 +506,17 @@ fn migrate_historical_rows(conn: &mut Connection) -> Result<(), ApplicationStora
         )
         .optional()?;
 
-    if current.as_deref() == Some(APP_SCHEMA_VERSION) {
-        return Ok(());
+    match current.as_deref() {
+        Some(APP_SCHEMA_VERSION) => return Ok(()),
+        Some(version_text) => {
+            let version = version_text.parse::<i64>().map_err(|_| {
+                ApplicationStorageError::InvalidSchemaVersion(version_text.to_string())
+            })?;
+            if version != 1 {
+                return Err(ApplicationStorageError::UnsupportedSchemaVersion(version));
+            }
+        }
+        None => {}
     }
 
     let should_import_legacy_totals = current.is_none();
@@ -714,6 +729,27 @@ mod tests {
         }
     }
 
+    fn set_application_schema_version(path: &Path, version: &str) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(APP_SCHEMA_SQL).unwrap();
+        conn.execute(
+            "INSERT INTO schema_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![APP_SCHEMA_META_KEY, version],
+        )
+        .unwrap();
+    }
+
+    fn read_application_schema_version(path: &Path) -> String {
+        let conn = Connection::open(path).unwrap();
+        conn.query_row(
+            "SELECT value FROM schema_meta WHERE key = ?1",
+            [APP_SCHEMA_META_KEY],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn legacy_domain_rows_are_visible_as_historical_application() {
         let path = temp_db_path("migration");
@@ -792,6 +828,42 @@ mod tests {
         assert_eq!(apps[0].application, "chrome.exe");
         assert_eq!(apps[0].bytes, 100);
         assert_eq!(storage.totals(TrafficPeriod::All).unwrap().bytes, 100);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn newer_application_schema_is_rejected_without_downgrade() {
+        let path = temp_db_path("newer_schema");
+        drop(Storage::open(&path).unwrap());
+        set_application_schema_version(&path, "3");
+
+        let error = match ApplicationStorage::open(&path) {
+            Ok(_) => panic!("newer application schema should be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ApplicationStorageError::UnsupportedSchemaVersion(3)
+        ));
+        assert_eq!(read_application_schema_version(&path), "3");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn invalid_application_schema_is_rejected_without_rewrite() {
+        let path = temp_db_path("invalid_schema");
+        drop(Storage::open(&path).unwrap());
+        set_application_schema_version(&path, "future");
+
+        let error = match ApplicationStorage::open(&path) {
+            Ok(_) => panic!("invalid application schema should be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ApplicationStorageError::InvalidSchemaVersion(ref value) if value == "future"
+        ));
+        assert_eq!(read_application_schema_version(&path), "future");
         cleanup(&path);
     }
 
