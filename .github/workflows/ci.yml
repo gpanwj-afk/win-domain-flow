@@ -2,8 +2,7 @@ name: ci
 
 on:
   pull_request:
-    branches:
-      - master
+    branches: [master]
 
 permissions:
   contents: read
@@ -12,21 +11,19 @@ jobs:
   repair-popup-e2e:
     if: github.head_ref == 'agent/v060-reliability-e2e' && github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v6
         with:
           ref: agent/v060-reliability-e2e
-      - name: Patch validator to use extension popup public messaging API
+      - name: Patch validator through popup messaging
         shell: python
         run: |
           from pathlib import Path
-          path = Path('tools/validate-windows.ps1')
-          text = path.read_text(encoding='utf-8')
-
-          old = '''    $serviceDebuggerUrl = Find-CdpTargetDebuggerUrl $BrowserDebugPort ([string]$extensionTarget.target.targetId) 15
+          path=Path('tools/validate-windows.ps1')
+          text=path.read_text(encoding='utf-8')
+          old='''    $serviceDebuggerUrl = Find-CdpTargetDebuggerUrl $BrowserDebugPort ([string]$extensionTarget.target.targetId) 15
               Assert-Evidence (-not [string]::IsNullOrWhiteSpace($serviceDebuggerUrl)) "Extension Service Worker debugger URL" ([string]$extensionTarget.target.targetId)
               $ExtensionSocket = Connect-Cdp $serviceDebuggerUrl
               [void](Send-Cdp $ExtensionSocket "Runtime.enable" @{})
@@ -38,7 +35,7 @@ jobs:
               [void](Evaluate-Cdp $ExtensionSocket "" $setExpression)
               Add-Result "Extension diagnostics enabled" "PASS" "receiverPort=$ReceiverPort"
           '''
-          new = '''    $extensionWorkerUrl = [string]$extensionTarget.target.url
+          new='''    $extensionWorkerUrl = [string]$extensionTarget.target.url
               if ($extensionWorkerUrl -notmatch '^((?:chrome|edge)-extension://[a-p]{32})/') {
                   throw "Could not derive packaged extension origin from service worker URL: $extensionWorkerUrl"
               }
@@ -59,50 +56,29 @@ jobs:
               $enableResponse = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:'diagnostics-set-enabled',enabled:true})"
               Assert-Evidence ([bool]$enableResponse.ok -and [bool]$enableResponse.enabled) "Extension diagnostics enabled" ($enableResponse | ConvertTo-Json -Compress)
           '''
-          if old not in text:
-              raise SystemExit('service worker debugger control block not found')
-          text = text.replace(old, new, 1)
-
-          text = text.replace(
-              '$extensionHealth = Evaluate-Cdp $ExtensionSocket "" "({enabled:diagnosticsEnabled,attachedTabs:attachedTabs.size,queueLength:eventQueue.length,lastAttachError,lastReceiverError})"',
-              '$extensionHealth = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:\'diagnostics-health\'})"',
-          )
-          text = text.replace(
-              '$outageHealth = Evaluate-Cdp $ExtensionSocket "" "({queueLength:eventQueue.length,lastReceiverError})"',
-              '$outageHealth = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:\'diagnostics-health\'})"',
-          )
-          text = text.replace(
-              '$recoveryHealth = Evaluate-Cdp $ExtensionSocket "" "({queueLength:eventQueue.length,lastReceiverError})"',
-              '$recoveryHealth = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:\'diagnostics-health\'})"',
-          )
-
-          old_restore = '''            $restoreValue = if ($PreviousDiagnosticsEnabled) { "true" } else { "false" }
-              [void](Evaluate-Cdp $ExtensionSocket "" "chrome.storage.local.set({diagnosticsEnabled:$restoreValue}).then(()=>true)")
-              Add-Result "Extension diagnostics setting restored" "PASS" "diagnosticsEnabled=$restoreValue"
-          '''
-          new_restore = '''            $restoreValue = if ($PreviousDiagnosticsEnabled) { "true" } else { "false" }
-              $restorePort = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:'diagnostics-set-receiver-port',port:38765})"
+          if old not in text: raise SystemExit('service worker debugger control block not found')
+          text=text.replace(old,new,1)
+          replacements={
+            '$extensionHealth = Evaluate-Cdp $ExtensionSocket "" "({enabled:diagnosticsEnabled,attachedTabs:attachedTabs.size,queueLength:eventQueue.length,lastAttachError,lastReceiverError})"':'$extensionHealth = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:\'diagnostics-health\'})"',
+            '$outageHealth = Evaluate-Cdp $ExtensionSocket "" "({queueLength:eventQueue.length,lastReceiverError})"':'$outageHealth = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:\'diagnostics-health\'})"',
+            '$recoveryHealth = Evaluate-Cdp $ExtensionSocket "" "({queueLength:eventQueue.length,lastReceiverError})"':'$recoveryHealth = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:\'diagnostics-health\'})"',
+          }
+          for a,b in replacements.items():
+              if a not in text: raise SystemExit(f'health expression not found: {a[:40]}')
+              text=text.replace(a,b,1)
+          old_line='[void](Evaluate-Cdp $ExtensionSocket "" "chrome.storage.local.set({diagnosticsEnabled:$restoreValue}).then(()=>true)")'
+          new_lines='''$restorePort = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:'diagnostics-set-receiver-port',port:38765})"
               $restoreEnabled = Evaluate-Cdp $ExtensionSocket "" "chrome.runtime.sendMessage({type:'diagnostics-set-enabled',enabled:$restoreValue})"
-              if (-not [bool]$restorePort.ok -or -not [bool]$restoreEnabled.ok) { throw "Extension settings restore was rejected" }
-              Add-Result "Extension diagnostics setting restored" "PASS" "diagnosticsEnabled=$restoreValue; receiverPort=38765"
-          '''
-          if old_restore not in text:
-              raise SystemExit('extension restore block not found')
-          text = text.replace(old_restore, new_restore, 1)
-
-          required = [
-              'Extension popup debugger URL',
-              'Extension popup Runtime context',
-              "chrome.runtime.sendMessage({type:'diagnostics-health'})",
-              "diagnostics-set-receiver-port",
-              "diagnostics-set-enabled",
-          ]
-          for needle in required:
-              if needle not in text:
-                  raise SystemExit(f'patched validator missing {needle}')
-          if 'Extension Service Worker debugger URL' in text:
-              raise SystemExit('obsolete service worker debugger gate still present')
-          path.write_text(text, encoding='utf-8')
+              if (-not [bool]$restorePort.ok -or -not [bool]$restoreEnabled.ok) { throw "Extension settings restore was rejected" }'''
+          if old_line not in text: raise SystemExit('restore storage line not found')
+          text=text.replace(old_line,new_lines,1)
+          old_add='Add-Result "Extension diagnostics setting restored" "PASS" "diagnosticsEnabled=$restoreValue"'
+          if old_add not in text: raise SystemExit('restore result line not found')
+          text=text.replace(old_add,'Add-Result "Extension diagnostics setting restored" "PASS" "diagnosticsEnabled=$restoreValue; receiverPort=38765"',1)
+          for needle in ['Extension popup debugger URL','Extension popup Runtime context',"chrome.runtime.sendMessage({type:'diagnostics-health'})",'diagnostics-set-receiver-port','diagnostics-set-enabled']:
+              if needle not in text: raise SystemExit(f'missing patched marker: {needle}')
+          if 'Extension Service Worker debugger URL' in text: raise SystemExit('obsolete debugger gate remains')
+          path.write_text(text,encoding='utf-8')
       - name: Commit validator patch
         shell: bash
         run: |
