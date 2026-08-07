@@ -12,6 +12,7 @@ concurrency:
   group: diagnose-v060-e2e
   cancel-in-progress: true
 
+# Temporary bounded diagnostic workflow. Remove before merging PR #7.
 jobs:
   diagnose:
     runs-on: windows-latest
