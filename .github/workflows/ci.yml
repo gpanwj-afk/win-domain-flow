@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install native build dependencies
         run: |
@@ -68,6 +68,7 @@ jobs:
           assert "webRequest" not in permissions
           assert "<all_urls>" not in hosts
           assert hosts == ["http://127.0.0.1/*"]
+          assert manifest.get("action", {}).get("default_popup") == "popup.html"
 
           public_key = base64.b64decode(manifest["key"], validate=True)
           digest = hashlib.sha256(public_key).digest()[:16]
@@ -121,7 +122,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust 1.88.0 MSVC
         uses: dtolnay/rust-toolchain@1.88.0
@@ -222,7 +223,7 @@ jobs:
 
       - name: Upload browser E2E evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: win-domain-flow-browser-e2e-evidence
           if-no-files-found: warn
@@ -274,10 +275,89 @@ jobs:
             if (!(Test-Path $item)) { throw "Package item missing: $item" }
           }
 
+          $forbidden = @(Get-ChildItem $package -Recurse -Force | Where-Object {
+            $_.Name -match '(?i)\.(pem|key|pfx|p12|db)$' -or
+            $_.Name -match '(?i)(\.db-wal|\.db-shm|validation-report|validation-manifest|edge-profile)'
+          })
+          if ($forbidden.Count -gt 0) {
+            $forbidden | ForEach-Object { Write-Host "Forbidden package item: $($_.FullName)" }
+            throw "Release package contains private, runtime, or validation-only files"
+          }
+
       - name: Upload Windows x64 package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: win-domain-flow-windows-x64
           if-no-files-found: error
           retention-days: 14
           path: dist/win-domain-flow-windows-x64/**
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs:
+      - linux-quality
+      - windows-product
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v6
+
+      - name: Download validated Windows package
+        uses: actions/download-artifact@v8
+        with:
+          name: win-domain-flow-windows-x64
+          path: dist/win-domain-flow-windows-x64
+
+      - name: Prepare release assets
+        id: release_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          tag="v$version"
+          archive="win-domain-flow-${tag}-windows-x64.zip"
+          test -f dist/win-domain-flow-windows-x64/win-domain-flow-gui.exe
+          test -f dist/win-domain-flow-windows-x64/browser-extension/manifest.json
+          (cd dist && zip -q -r "../$archive" win-domain-flow-windows-x64)
+          sha256sum "$archive" > "$archive.sha256"
+          cat > RELEASE_NOTES.md <<EOF
+          ## win-domain-flow $tag
+
+          Windows x64 stable release built from commit \`$GITHUB_SHA\`.
+
+          Release gates completed before publication:
+          - Rust 1.88 format, check, tests, Clippy with \`-D warnings\`, and release build
+          - Windows MSVC check, Clippy, and release build against Npcap SDK 1.16
+          - isolated Edge/Chrome extension E2E using a temporary profile and SQLite database
+          - Receiver outage queueing and automatic replay after Receiver recovery
+          - release-package content and forbidden-file scan
+
+          Extract the ZIP and run \`Start-GUI-As-Administrator.cmd\`. Npcap must be installed for live packet capture.
+          EOF
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Publish immutable GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release_meta.outputs.tag }}
+          ARCHIVE: ${{ steps.release_meta.outputs.archive }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; refusing to overwrite an existing stable release."
+            exit 0
+          fi
+          gh release create "$TAG" \
+            "$ARCHIVE" \
+            "$ARCHIVE.sha256" \
+            --target "$GITHUB_SHA" \
+            --title "win-domain-flow $TAG" \
+            --notes-file RELEASE_NOTES.md \
+            --latest
