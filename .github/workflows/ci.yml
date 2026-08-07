@@ -231,12 +231,12 @@ jobs:
 
           $archive = Join-Path $env:RUNNER_TEMP "chrome-for-testing.zip"
           $extractRoot = Join-Path $env:RUNNER_TEMP "chrome-for-testing"
-          # Stage the executable under the real Program Files ACL tree. Chrome's
-          # Windows sandbox AppContainer cannot execute a copied browser from
-          # GitHub Runner's private _temp ACL tree.
-          $fakeProgramFiles = Join-Path $env:ProgramFiles "DomainFlow-CfT-ProgramFiles"
-          $targetDir = Join-Path $fakeProgramFiles "Google\Chrome\Application"
-          Remove-Item $archive, $extractRoot, $fakeProgramFiles -Recurse -Force -ErrorAction SilentlyContinue
+          # Stage under the real Program Files ACL tree. Chrome's Windows
+          # sandbox AppContainer cannot execute a copied browser from the
+          # hosted runner's private _temp ACL tree.
+          $programRoot = Join-Path $env:ProgramFiles "DomainFlow-CfT-ProgramFiles"
+          $targetDir = Join-Path $programRoot "Google\Chrome\Application"
+          Remove-Item $archive, $extractRoot, $programRoot -Recurse -Force -ErrorAction SilentlyContinue
 
           $downloaded = $false
           for ($attempt = 1; $attempt -le 4; $attempt++) {
@@ -269,55 +269,31 @@ jobs:
           if (-not $chrome) { throw "Chrome for Testing chrome.exe was not found" }
           New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
           Copy-Item (Join-Path $chrome.DirectoryName "*") $targetDir -Recurse -Force
-          if (!(Test-Path (Join-Path $targetDir "chrome.exe"))) {
+          $stagedChrome = Join-Path $targetDir "chrome.exe"
+          if (!(Test-Path $stagedChrome)) {
             throw "Chrome for Testing staging failed"
           }
 
-          # Keep the grants read/execute only and scoped to the isolated test
-          # browser. Program Files normally already carries these ACLs, but the
-          # explicit grant makes the hosted-runner sandbox requirement stable.
-          & icacls.exe $fakeProgramFiles /grant "*S-1-15-2-1:(OI)(CI)RX" /T /C | Out-Host
+          # Keep grants read/execute only and scoped to the isolated test
+          # browser. Program Files normally inherits these ACLs; the explicit
+          # grants make the hosted-runner sandbox requirement deterministic.
+          & icacls.exe $programRoot /grant "*S-1-15-2-1:(OI)(CI)RX" /T /C | Out-Host
           if ($LASTEXITCODE -ne 0) { throw "Failed to grant ALL APPLICATION PACKAGES read/execute access" }
-          & icacls.exe $fakeProgramFiles /grant "*S-1-15-2-2:(OI)(CI)RX" /T /C | Out-Host
+          & icacls.exe $programRoot /grant "*S-1-15-2-2:(OI)(CI)RX" /T /C | Out-Host
           if ($LASTEXITCODE -ne 0) { throw "Failed to grant ALL RESTRICTED APPLICATION PACKAGES read/execute access" }
 
-          "DOMAINFLOW_CFT_PROGRAM_FILES=$fakeProgramFiles" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "DOMAINFLOW_BROWSER_EXECUTABLE=$stagedChrome" | Out-File -FilePath $env:GITHUB_ENV -Append
           "DOMAINFLOW_CFT_VERSION=$($stable.version)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Isolated Chrome for Testing browser diagnostics E2E
         timeout-minutes: 6
         shell: pwsh
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:DOMAINFLOW_CFT_PROGRAM_FILES)) {
-            throw "Chrome for Testing staging path is missing"
+          if ([string]::IsNullOrWhiteSpace($env:DOMAINFLOW_BROWSER_EXECUTABLE)) {
+            throw "Chrome for Testing executable path is missing"
           }
-          $env:ProgramFiles = $env:DOMAINFLOW_CFT_PROGRAM_FILES
           Write-Host "Using Chrome for Testing $env:DOMAINFLOW_CFT_VERSION"
-
-          # Temporary diagnostic instrumentation. This changes only the runner's
-          # workspace copy; the checked-in validator remains the release source.
-          $validator = "tools\validate-windows.ps1"
-          $text = Get-Content -LiteralPath $validator -Raw
-          $old = @'
-              $Results.Add([pscustomobject]@{
-                  name = $Name
-                  status = $Status
-                  evidence = $Evidence
-              }) | Out-Null
-          }
-          '@
-          $new = @'
-              $Results.Add([pscustomobject]@{
-                  name = $Name
-                  status = $Status
-                  evidence = $Evidence
-              }) | Out-Null
-              Write-Host "E2E[$Status] $Name :: $Evidence"
-          }
-          '@
-          if (-not $text.Contains($old)) { throw "E2E milestone instrumentation point missing" }
-          Set-Content -LiteralPath $validator -Value $text.Replace($old, $new) -Encoding UTF8
-
+          Write-Host "Browser executable: $env:DOMAINFLOW_BROWSER_EXECUTABLE"
           $report = Join-Path $env:RUNNER_TEMP "domainflow-browser-e2e"
           .\tools\validate-windows.ps1 `
             -BinaryRoot ".\target\x86_64-pc-windows-msvc\release" `
