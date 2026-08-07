@@ -1,4 +1,4 @@
-# win-domain-flow 0.6 Installation
+# win-domain-flow 0.6.1 Installation
 
 The current Windows installation, upgrade, browser diagnostics, isolation, and source-build instructions are maintained in:
 
@@ -14,9 +14,11 @@ Quick start:
 4. Confirm the absolute SQLite path shown by the GUI, select the active physical adapter, and start capture.
 5. For request/download diagnostics, load the unpacked `browser-extension` folder in Edge or Chrome and explicitly enable deep diagnostics.
 
-v0.6 adds a stable packaged extension identity, exact Receiver Origin authentication, a persisted bounded retry queue, monotonic transferred-byte updates, redirect preservation, `/status` PID/database observability, duplicate-GUI protection, and explicit legacy-database migration using SQLite's online backup API.
+v0.6.1 is a stability release. Base domain totals and application/domain details are now committed in one SQLite transaction, future application-schema versions are rejected before application-layer DDL can run, dashboard periods use UTC day/month boundaries that match the persisted daily buckets, and isolated Receiver entry points normalize relative database paths to absolute paths before startup.
 
-The optional extension only has loopback host permission (`http://127.0.0.1/*`) and does not read HTTPS response bodies.
+The browser extension protocol and permissions are unchanged from v0.6. The optional extension only has loopback host permission (`http://127.0.0.1/*`) and does not read HTTPS response bodies.
+
+v0.6 introduced a stable packaged extension identity, exact Receiver Origin authentication, a persisted bounded retry queue, monotonic transferred-byte updates, redirect preservation, `/status` PID/database observability, duplicate-GUI protection, and explicit legacy-database migration using SQLite's online backup API.
 
 ## Isolated validation
 
