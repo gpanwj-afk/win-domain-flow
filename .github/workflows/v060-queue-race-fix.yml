@@ -1,0 +1,98 @@
+name: v060-queue-race-fix
+
+on:
+  push:
+    branches:
+      - agent/v060-reliability-e2e
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/v060-reliability-e2e
+          fetch-depth: 0
+      - name: Patch queue revision handling
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("browser-extension/service_worker.js")
+          text = path.read_text()
+          old = '''      try {
+                  await deliverEvent(entry.payload);
+                  eventQueue.shift();
+                  lastReceiverError = null;
+                  await persistQueue();
+                } catch (error) {'''
+          new = '''      const revision = Number(entry.revision) || 0;
+                const payload = entry.payload;
+                try {
+                  await deliverEvent(payload);
+                  if (eventQueue[0] === entry && (Number(entry.revision) || 0) === revision) {
+                    eventQueue.shift();
+                  } else {
+                    // A partial/final report updated this exact queue item while
+                    // the older revision was in flight. Keep the newer revision
+                    // at the head so it is delivered on the next loop.
+                    entry.attempts = 0;
+                    entry.nextAttemptAt = 0;
+                  }
+                  lastReceiverError = null;
+                  await persistQueue();
+                } catch (error) {'''
+          if old not in text:
+              raise SystemExit("queue delivery marker not found")
+          text = text.replace(old, new, 1)
+
+          old = '''        eventQueue[existingIndex].payload = mergePayload(eventQueue[existingIndex].payload, payload);
+              eventQueue[existingIndex].attempts = 0;
+              eventQueue[existingIndex].nextAttemptAt = 0;'''
+          new = '''        eventQueue[existingIndex].payload = mergePayload(eventQueue[existingIndex].payload, payload);
+              eventQueue[existingIndex].revision = (Number(eventQueue[existingIndex].revision) || 0) + 1;
+              eventQueue[existingIndex].attempts = 0;
+              eventQueue[existingIndex].nextAttemptAt = 0;'''
+          if old not in text:
+              raise SystemExit("queue merge marker not found")
+          text = text.replace(old, new, 1)
+
+          old = '''        eventQueue.push({ payload, attempts: 0, nextAttemptAt: 0 });'''
+          new = '''        eventQueue.push({ payload, attempts: 0, nextAttemptAt: 0, revision: 0 });'''
+          if old not in text:
+              raise SystemExit("queue push marker not found")
+          text = text.replace(old, new, 1)
+
+          old = '''        ? values[QUEUE_STORAGE_KEY].filter((entry) => entry && entry.payload && entry.payload.eventId).slice(-MAX_QUEUE_LENGTH)
+              : [];'''
+          new = '''        ? values[QUEUE_STORAGE_KEY]
+                  .filter((entry) => entry && entry.payload && entry.payload.eventId)
+                  .slice(-MAX_QUEUE_LENGTH)
+                  .map((entry) => ({
+                    ...entry,
+                    revision: Number(entry.revision) || 0,
+                    attempts: Math.max(0, Number(entry.attempts) || 0),
+                    nextAttemptAt: Math.max(0, Number(entry.nextAttemptAt) || 0)
+                  }))
+              : [];'''
+          if old not in text:
+              raise SystemExit("queue restore marker not found")
+          text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+          node --check browser-extension/service_worker.js
+          grep -q 'revision' browser-extension/service_worker.js
+      - name: Commit patch
+        shell: bash
+        run: |
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add browser-extension/service_worker.js
+          git commit -m "preserve updated queue revisions during in-flight delivery"
+          git pull --rebase origin agent/v060-reliability-e2e
+          git push origin HEAD:agent/v060-reliability-e2e
