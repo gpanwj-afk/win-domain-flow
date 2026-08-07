@@ -1,0 +1,110 @@
+name: diagnose-v060-e2e
+
+on:
+  push:
+    branches:
+      - agent/v060-reliability-e2e
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diagnose-v060-e2e
+  cancel-in-progress: true
+
+jobs:
+  diagnose:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Npcap SDK 1.16
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archive = Join-Path $env:RUNNER_TEMP "npcap-sdk.zip"
+          $root = Join-Path $env:RUNNER_TEMP "npcap-sdk"
+          & curl.exe --fail --location --retry 5 --retry-all-errors --retry-delay 3 --output $archive "https://npcap.com/dist/npcap-sdk-1.16.zip"
+          if ($LASTEXITCODE -ne 0) { throw "Npcap SDK download failed" }
+          Expand-Archive -Path $archive -DestinationPath $root -Force
+          $library = Get-ChildItem $root -Recurse -Filter wpcap.lib | Where-Object { $_.FullName -match "(?i)(x64|amd64)" } | Select-Object -First 1
+          $header = Get-ChildItem $root -Recurse -Filter pcap.h | Select-Object -First 1
+          if (-not $library -or -not $header) { throw "Npcap SDK layout incomplete" }
+          "LIB=$($library.DirectoryName);$env:LIB" | Out-File $env:GITHUB_ENV -Append
+          "INCLUDE=$($header.DirectoryName);$env:INCLUDE" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Build Windows release binaries
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Install Chrome for Testing
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $metadata = Invoke-RestMethod -Uri "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json" -TimeoutSec 30
+          $stable = $metadata.channels.Stable
+          $download = @($stable.downloads.chrome | Where-Object { $_.platform -eq "win64" })[0]
+          $archive = Join-Path $env:RUNNER_TEMP "cft.zip"
+          $extractRoot = Join-Path $env:RUNNER_TEMP "cft"
+          $fakeProgramFiles = Join-Path $env:RUNNER_TEMP "cft-program-files"
+          $targetDir = Join-Path $fakeProgramFiles "Google\Chrome\Application"
+          & curl.exe --fail --location --retry 5 --retry-all-errors --retry-delay 3 --output $archive $download.url
+          if ($LASTEXITCODE -ne 0) { throw "Chrome for Testing download failed" }
+          Expand-Archive -Path $archive -DestinationPath $extractRoot -Force
+          $chrome = Get-ChildItem $extractRoot -Recurse -Filter chrome.exe | Select-Object -First 1
+          if (-not $chrome) { throw "Chrome for Testing executable missing" }
+          New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+          Copy-Item (Join-Path $chrome.DirectoryName "*") $targetDir -Recurse -Force
+          "DOMAINFLOW_CFT_PROGRAM_FILES=$fakeProgramFiles" | Out-File $env:GITHUB_ENV -Append
+          "DOMAINFLOW_CFT_VERSION=$($stable.version)" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Add temporary milestone logging
+        shell: pwsh
+        run: |
+          $path = "tools\validate-windows.ps1"
+          $text = Get-Content -LiteralPath $path -Raw
+          $old = @'
+              $Results.Add([pscustomobject]@{
+                  name = $Name
+                  status = $Status
+                  evidence = $Evidence
+              }) | Out-Null
+          }
+          '@
+          $new = @'
+              $Results.Add([pscustomobject]@{
+                  name = $Name
+                  status = $Status
+                  evidence = $Evidence
+              }) | Out-Null
+              Write-Host "E2E[$Status] $Name :: $Evidence"
+          }
+          '@
+          if (-not $text.Contains($old)) { throw "Add-Result diagnostic insertion point missing" }
+          Set-Content -LiteralPath $path -Value $text.Replace($old, $new) -Encoding UTF8
+
+      - name: Diagnose isolated browser E2E
+        timeout-minutes: 6
+        shell: pwsh
+        run: |
+          $env:ProgramFiles = $env:DOMAINFLOW_CFT_PROGRAM_FILES
+          Write-Host "Diagnostic Chrome for Testing version: $env:DOMAINFLOW_CFT_VERSION"
+          .\tools\validate-windows.ps1 `
+            -BinaryRoot ".\target\x86_64-pc-windows-msvc\release" `
+            -OutputDirectory (Join-Path $env:RUNNER_TEMP "domainflow-browser-e2e") `
+            -CiMode
+
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: diagnose-v060-e2e-evidence
+          if-no-files-found: warn
+          retention-days: 3
+          path: ${{ runner.temp }}/domainflow-browser-e2e/**
