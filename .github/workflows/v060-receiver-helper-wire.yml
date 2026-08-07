@@ -20,12 +20,11 @@ jobs:
         with:
           ref: agent/v060-reliability-e2e
           fetch-depth: 0
-      - name: Wire helper executable into validator and CI
+      - name: Wire helper executable into validator
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
-
           validator = Path("tools/validate-windows.ps1")
           text = validator.read_text()
           old = '$Cli = Join-Path $BinaryRoot "win-domain-flow.exe"\n$ExtensionDir'
@@ -65,35 +64,6 @@ jobs:
           if 'Start-ToolProcess $Cli @("browser-receiver"' in text:
               raise SystemExit("validator still uses main CLI for receiver")
           validator.write_text(text)
-
-          ci = Path(".github/workflows/ci.yml")
-          text = ci.read_text()
-          text = text.replace(
-              '          assert "reportChain" in worker\n          assert "redirectResponse" in worker',
-              '          assert "reportChain" in worker\n          assert "revision" in worker\n          assert "redirectResponse" in worker',
-              1,
-          )
-          text = text.replace(
-              '          test -f target/release/win-domain-flow-gui\n',
-              '          test -f target/release/win-domain-flow-gui\n          test -f target/release/win-domain-flow-browser-receiver\n',
-              1,
-          )
-          text = text.replace(
-              '          if (!(Test-Path "$root\\win-domain-flow-gui.exe")) { throw "GUI executable missing" }\n',
-              '          if (!(Test-Path "$root\\win-domain-flow-gui.exe")) { throw "GUI executable missing" }\n          if (!(Test-Path "$root\\win-domain-flow-browser-receiver.exe")) { throw "Receiver helper executable missing" }\n',
-              1,
-          )
-          text = text.replace(
-              '          Copy-Item "$source\\win-domain-flow-gui.exe" $package\n',
-              '          Copy-Item "$source\\win-domain-flow-gui.exe" $package\n          Copy-Item "$source\\win-domain-flow-browser-receiver.exe" $package\n',
-              1,
-          )
-          text = text.replace(
-              '            "$package\\win-domain-flow-gui.exe",\n',
-              '            "$package\\win-domain-flow-gui.exe",\n            "$package\\win-domain-flow-browser-receiver.exe",\n',
-              1,
-          )
-          ci.write_text(text)
           PY
       - name: Parse validator
         shell: pwsh
@@ -109,13 +79,13 @@ jobs:
             $errors | ForEach-Object { Write-Host $_.Message }
             throw "PowerShell syntax errors found"
           }
-      - name: Commit helper wiring
+      - name: Commit validator wiring
         shell: bash
         run: |
           git diff --check
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add tools/validate-windows.ps1 .github/workflows/ci.yml
+          git add tools/validate-windows.ps1
           git commit -m "use Npcap-independent receiver for Windows E2E"
           git pull --rebase origin agent/v060-reliability-e2e
           git push origin HEAD:agent/v060-reliability-e2e
