@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - agent/v060-reliability-e2e
+  pull_request:
+    branches:
+      - master
 
 permissions:
   contents: write
@@ -37,9 +40,6 @@ jobs:
                   if (eventQueue[0] === entry && (Number(entry.revision) || 0) === revision) {
                     eventQueue.shift();
                   } else {
-                    // A partial/final report updated this exact queue item while
-                    // the older revision was in flight. Keep the newer revision
-                    // at the head so it is delivered on the next loop.
                     entry.attempts = 0;
                     entry.nextAttemptAt = 0;
                   }
@@ -85,7 +85,7 @@ jobs:
           path.write_text(text)
           PY
           node --check browser-extension/service_worker.js
-          grep -q 'revision' browser-extension/service_worker.js
+          grep -q 'entry.revision' browser-extension/service_worker.js
       - name: Commit patch
         shell: bash
         run: |
