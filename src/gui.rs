@@ -685,9 +685,8 @@ impl DashboardApp {
         ui.add_space(12.0);
 
         let content_width = ui.available_width();
-        if content_width >= 940.0 {
+        if content_width >= 980.0 {
             ui.columns(2, |columns| {
-                columns[0].set_min_width((content_width * 0.38).max(340.0));
                 self.render_applications(&mut columns[0], palette);
                 self.render_domains(&mut columns[1], palette);
             });
@@ -908,10 +907,15 @@ impl eframe::App for DashboardApp {
                     .inner_margin(egui::Margin::same(18)),
             )
             .show(ctx, |ui| {
+                let viewport_width = ui.available_width();
                 egui::ScrollArea::vertical()
                     .id_salt("main-dashboard-scroll")
                     .auto_shrink([false, false])
-                    .show(ui, |ui| self.render_dashboard(ui, palette));
+                    .show(ui, |ui| {
+                        ui.set_width(viewport_width);
+                        ui.set_max_width(viewport_width);
+                        self.render_dashboard(ui, palette);
+                    });
             });
 
         ctx.request_repaint_after(UI_TICK);
