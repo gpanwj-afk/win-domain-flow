@@ -17,6 +17,7 @@ const QUEUE_STORAGE_KEY = "pendingEventQueue";
 // persisted separately so a suspended Manifest V3 worker does not lose events.
 const pending = new Map();
 const attachedTabs = new Set();
+const attachingTabs = new Set();
 const tabStates = new Map();
 const requestSequences = new Map();
 let diagnosticsEnabled = false;
@@ -409,27 +410,53 @@ async function maybeReportPartial(item) {
 }
 
 async function attachTab(tab) {
-  if (!diagnosticsEnabled || !tab || !Number.isInteger(tab.id) || !isInspectableUrl(tab.url) || attachedTabs.has(tab.id)) {
+  if (
+    !diagnosticsEnabled ||
+    !tab ||
+    !Number.isInteger(tab.id) ||
+    !isInspectableUrl(tab.url) ||
+    attachedTabs.has(tab.id) ||
+    attachingTabs.has(tab.id)
+  ) {
     return;
   }
   const target = { tabId: tab.id };
+  let debuggerAttached = false;
+  attachingTabs.add(tab.id);
   updateTabState(tab.id, { title: tab.title || null, url: tab.url || null });
   try {
     await chrome.debugger.attach(target, PROTOCOL_VERSION);
+    debuggerAttached = true;
     await chrome.debugger.sendCommand(target, "Network.enable", {
       maxTotalBufferSize: 0,
       maxResourceBufferSize: 0,
       maxPostDataSize: 0
     });
+    if (!diagnosticsEnabled) {
+      await chrome.debugger.detach(target);
+      debuggerAttached = false;
+      updateTabState(tab.id, { attached: false, lastAttachError: null });
+      return;
+    }
     attachedTabs.add(tab.id);
     updateTabState(tab.id, { attached: true, lastAttachError: null });
     lastAttachError = null;
   } catch (error) {
+    attachedTabs.delete(tab.id);
+    if (debuggerAttached) {
+      try {
+        await chrome.debugger.detach(target);
+      } catch {
+        // The browser may already have detached the target.
+      }
+    }
     const message = `${tab.title || tab.url || `tab ${tab.id}`}: ${error && error.message ? error.message : error}`;
     updateTabState(tab.id, { attached: false, lastAttachError: message });
     lastAttachError = message;
+  } finally {
+    attachingTabs.delete(tab.id);
+    await updateBadge();
   }
-  await updateBadge();
 }
 
 async function attachAllTabs() {

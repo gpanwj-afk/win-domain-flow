@@ -548,7 +548,14 @@ try {
     $extensionHealth = Evaluate-Cdp $BrowserSocket $ServiceSession "chrome.runtime.sendMessage({type:'diagnostics-health'})"
     Assert-Evidence ([bool]$extensionHealth.enabled) "Extension runtime enabled" ($extensionHealth | ConvertTo-Json -Compress)
     Assert-Evidence ([int]$extensionHealth.attachedTabs -gt 0) "At least one browser tab attached" "attachedTabs=$($extensionHealth.attachedTabs)"
+    Assert-Evidence ([string]::IsNullOrWhiteSpace([string]$extensionHealth.lastAttachError)) "Extension debugger attachment healthy" ([string]$extensionHealth.lastAttachError)
     Assert-Evidence ([string]::IsNullOrWhiteSpace([string]$extensionHealth.lastReceiverError)) "Extension Receiver delivery healthy" "queueLength=$($extensionHealth.queueLength)"
+    $fixtureTabs = @($extensionHealth.tabs | Where-Object {
+        [bool]$_.attached -and [string]$_.url -like "http://127.0.0.1:$($Fixture.port)/*"
+    })
+    Assert-Evidence ($fixtureTabs.Count -gt 0) "Fixture tab is debugger-attached" ($fixtureTabs | ConvertTo-Json -Compress)
+    $outageTabId = [int]$fixtureTabs[0].tabId
+    $lastEventBeforeOutage = [int64]$fixtureTabs[0].lastEventAt
 
     $beforeRestartCount = [int]$DatabaseEvidence.request_count
     Stop-ExactProcess $ReceiverProcess "Receiver"
@@ -559,19 +566,25 @@ try {
     } catch { $stoppedProbeFailed = $true }
     Assert-Evidence $stoppedProbeFailed "Receiver actually stopped" "port $ReceiverPort no longer answered /status"
 
-    # Generate real browser traffic while the Receiver is down. This must be
-    # retained by the extension queue rather than written directly to SQLite.
-    $outageTarget = Send-Cdp $BrowserSocket "Target.createTarget" @{ url = "http://127.0.0.1:$($Fixture.port)/index.html?receiver_outage=1" }
-    $OwnedTargets.Add([string]$outageTarget.targetId) | Out-Null
+    # Navigate a tab that the extension has already attached. Creating a new
+    # target directly at the final URL races page load against chrome.debugger.attach
+    # and can produce no Network events even though the queue is healthy.
+    $outageUrl = "http://127.0.0.1:$($Fixture.port)/index.html?receiver_outage=1"
+    $outageNavigation = Evaluate-Cdp $BrowserSocket $ServiceSession "chrome.tabs.update($outageTabId,{url:'$outageUrl'}).then(tab=>({id:tab.id,url:tab.url}))"
+    Assert-Evidence ([int]$outageNavigation.id -eq $outageTabId) "Outage navigation uses attached fixture tab" ($outageNavigation | ConvertTo-Json -Compress)
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     $queuedDuringOutage = $false
     $receiverErrorDuringOutage = $false
+    $outageEventObserved = $false
     do {
         Start-Sleep -Milliseconds 400
         $outageHealth = Evaluate-Cdp $BrowserSocket $ServiceSession "chrome.runtime.sendMessage({type:'diagnostics-health'})"
+        $outageTab = @($outageHealth.tabs | Where-Object { [int]$_.tabId -eq $outageTabId }) | Select-Object -First 1
+        $outageEventObserved = $null -ne $outageTab -and [int64]$outageTab.lastEventAt -gt $lastEventBeforeOutage
         $queuedDuringOutage = [int]$outageHealth.queueLength -gt 0
         $receiverErrorDuringOutage = -not [string]::IsNullOrWhiteSpace([string]$outageHealth.lastReceiverError)
-    } while ((-not ($queuedDuringOutage -and $receiverErrorDuringOutage)) -and [DateTime]::UtcNow -lt $deadline)
+    } while ((-not ($outageEventObserved -and $queuedDuringOutage -and $receiverErrorDuringOutage)) -and [DateTime]::UtcNow -lt $deadline)
+    Assert-Evidence $outageEventObserved "Attached fixture tab emitted outage Network events" "tabId=$outageTabId; lastEventAt=$($outageTab.lastEventAt)"
     Assert-Evidence $queuedDuringOutage "Receiver outage queues browser events" "queueLength=$($outageHealth.queueLength)"
     Assert-Evidence $receiverErrorDuringOutage "Receiver outage is visible to extension" ([string]$outageHealth.lastReceiverError)
 
@@ -606,8 +619,9 @@ try {
     Assert-Evidence $outageEventsPersisted "Outage-period browser events persisted after recovery" "before=$beforeRestartCount after=$($DatabaseEvidence.request_count)"
 
     $afterReplayCount = [int]$DatabaseEvidence.request_count
-    $postRestartTarget = Send-Cdp $BrowserSocket "Target.createTarget" @{ url = "http://127.0.0.1:$($Fixture.port)/index.html?restart=1" }
-    $OwnedTargets.Add([string]$postRestartTarget.targetId) | Out-Null
+    $postRestartUrl = "http://127.0.0.1:$($Fixture.port)/index.html?restart=1"
+    $postRestartNavigation = Evaluate-Cdp $BrowserSocket $ServiceSession "chrome.tabs.update($outageTabId,{url:'$postRestartUrl'}).then(tab=>({id:tab.id,url:tab.url}))"
+    Assert-Evidence ([int]$postRestartNavigation.id -eq $outageTabId) "Post-restart navigation uses attached fixture tab" ($postRestartNavigation | ConvertTo-Json -Compress)
     $deadline = [DateTime]::UtcNow.AddSeconds(25)
     do {
         Start-Sleep -Milliseconds 500
