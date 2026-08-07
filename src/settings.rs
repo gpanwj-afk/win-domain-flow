@@ -1,6 +1,7 @@
 use crate::app_storage::TrafficPeriod;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{backup::Backup, Connection, OpenFlags};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const PRODUCT_DIR: &str = "win-domain-flow";
 const DATABASE_FILE: &str = "domainflow.db";
@@ -178,9 +179,9 @@ pub fn database_parent(path: &Path) -> PathBuf {
 }
 
 /// Resolves the default database without silently splitting data between the
-/// installation folder and LOCALAPPDATA. A legacy database is copied with
-/// SQLite `VACUUM INTO`, which observes committed WAL data without checkpointing
-/// or mutating the source database.
+/// installation folder and LOCALAPPDATA. A legacy database is copied through
+/// SQLite's online backup API so committed WAL pages are included without
+/// checkpointing or mutating the source database.
 fn resolve_default_database() -> std::io::Result<(PathBuf, Option<String>)> {
     let persistent = default_database_path();
     if persistent.exists() {
@@ -220,12 +221,38 @@ fn resolve_default_database() -> std::io::Result<(PathBuf, Option<String>)> {
 }
 
 fn copy_sqlite_snapshot(source: &Path, destination: &Path) -> std::io::Result<()> {
-    let connection = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let source_connection = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(std::io::Error::other)?;
-    let destination_text = destination.to_string_lossy().to_string();
-    connection
-        .execute("VACUUM INTO ?1", [destination_text])
-        .map_err(std::io::Error::other)?;
+    let temporary = destination.with_extension(format!("migrating-{}", std::process::id()));
+    let _ = std::fs::remove_file(&temporary);
+    let mut destination_connection = Connection::open(&temporary).map_err(std::io::Error::other)?;
+
+    let backup_result = {
+        let backup = Backup::new(&source_connection, &mut destination_connection)
+            .map_err(std::io::Error::other)?;
+        backup
+            .run_to_completion(128, Duration::from_millis(10), None)
+            .map_err(std::io::Error::other)
+    };
+    drop(destination_connection);
+    drop(source_connection);
+
+    if let Err(error) = backup_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+
+    if destination.exists() {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("destination already exists: {}", destination.display()),
+        ));
+    }
+    if let Err(error) = std::fs::rename(&temporary, destination) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -284,6 +311,28 @@ fn decode_hex(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "domainflow_settings_{}_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            name
+        ));
+        path.set_extension("db");
+        path
+    }
+
+    fn cleanup_database(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
 
     #[test]
     fn hex_round_trip_preserves_chinese_and_paths() {
@@ -311,5 +360,39 @@ mod tests {
         assert_eq!(ThemeMode::from_key("dark"), ThemeMode::Dark);
         assert_eq!(ThemeMode::Light.toggled(), ThemeMode::Dark);
         assert_eq!(ThemeMode::Dark.toggled(), ThemeMode::Light);
+    }
+
+    #[test]
+    fn online_backup_copies_committed_wal_without_checkpointing_source() {
+        let source = temp_db_path("wal_source");
+        let destination = temp_db_path("wal_destination");
+        let connection = Connection::open(&source).unwrap();
+        connection.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE evidence(value INTEGER NOT NULL);
+             INSERT INTO evidence(value) VALUES (8192);",
+        )
+        .unwrap();
+
+        let wal_path = PathBuf::from(format!("{}-wal", source.display()));
+        assert!(wal_path.exists());
+        let wal_len_before = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(wal_len_before > 0);
+
+        copy_sqlite_snapshot(&source, &destination).unwrap();
+
+        let copied = Connection::open(&destination).unwrap();
+        let value: i64 = copied
+            .query_row("SELECT value FROM evidence", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 8192);
+        assert!(wal_path.exists());
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_len_before);
+
+        drop(copied);
+        drop(connection);
+        cleanup_database(&source);
+        cleanup_database(&destination);
     }
 }
