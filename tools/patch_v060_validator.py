@@ -1,8 +1,12 @@
 from pathlib import Path
+import re
 
 path = Path("tools/validate-windows.ps1")
 text = path.read_text()
-text = text.replace('throw "$Name: $Evidence"', 'throw "${Name}: $Evidence"', 1)
+# PowerShell parses `$name:` as scope/drive syntax inside expandable strings.
+# Delimit only variables where ':' is followed by punctuation/space; this does
+# not alter valid scoped variables such as $env:PATH or $script:counter.
+text = re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*):(?=[^A-Za-z0-9_])", r"${\1}:", text)
 start = text.index("    $beforeRestartCount = [int]$DatabaseEvidence.request_count")
 end = text.index("    $statusAfterRestart = Invoke-RestMethod", start)
 replacement = r'''    $beforeRestartCount = [int]$DatabaseEvidence.request_count
