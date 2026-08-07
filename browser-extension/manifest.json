@@ -6,6 +6,7 @@
   "minimum_chrome_version": "109",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAjmd/q9Eqmq6fjHDkk0jIBs0oYkMFYIw5CRoACxHBV5SkRcsFg0nDw0Abmmtnp0j71mfjC3RzlriFUV17eNod+NLZqli2cNo0m60a6GHSeibzRKMS/mHTk7BaCgdUaQKylLuSANvIDYKdvxemFau55t3p/nz198ELXDXCbuOH2fN8kamA3Q/+dPsHVQmlJ7vfMNcUTLyxPZjrA/70Bouf0zzOfu5j1X/8klRM15CHA3gbXF0RveanX9HAxItPpE+uK3D/bSo/Ze+lEAtdp6lLp9J9SHwFjiCuuVyKHFx6ti6oaSehERFcnCYlHsnoFkuRmdHHbkZnWmREwIyV7PC55wIDAQAB",
   "permissions": [
+    "alarms",
     "debugger",
     "downloads",
     "storage",
